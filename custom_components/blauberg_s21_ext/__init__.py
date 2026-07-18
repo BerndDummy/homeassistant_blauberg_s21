@@ -13,6 +13,8 @@ from .const import DOMAIN
 PLATFORMS: list[Platform] = [
     Platform.CLIMATE,
     Platform.BUTTON,
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
     Platform.SWITCH,
     Platform.SELECT,
 ]

@@ -16,6 +16,19 @@ It is an extended version of **[jvitkauskas' original development](https://githu
 The major differences include:
 - Expanded attributes: All temperatures, scheduler status, alarm code
 - New control functions: Timer mode, boost mode, alarm reset, bypass/rotor mode
+- Native monitoring entities for temperatures, air pressure, connection, alarm and filter state
+
+### Native monitoring entities
+
+The integration exposes the following device values as regular Home Assistant entities, so no additional template YAML is required:
+
+- Four temperature sensors (`intake in/out` and `outlet in/out`)
+- Incoming and outgoing air pressure sensors
+- Connection status
+- Alarm status, including the reported alarm codes
+- Filter warning, including the reported filter countdown
+
+All entities belong to the configured Blauberg device. Values that are not supported by a particular unit remain unavailable. The source values have been validated on a Blauberg KOMFORT EC LB300-E S21.
 
 
 ## Installation and Configuration

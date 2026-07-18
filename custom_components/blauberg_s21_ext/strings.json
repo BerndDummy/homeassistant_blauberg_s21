@@ -47,6 +47,19 @@
           "auto": "Automatic"
         }
       }
+    },
+    "sensor": {
+      "intake_temperature_in": { "name": "Intake temperature in" },
+      "intake_temperature_out": { "name": "Intake temperature out" },
+      "outlet_temperature_in": { "name": "Outlet temperature in" },
+      "outlet_temperature_out": { "name": "Outlet temperature out" },
+      "incoming_air_pressure": { "name": "Incoming air pressure" },
+      "outgoing_air_pressure": { "name": "Outgoing air pressure" }
+    },
+    "binary_sensor": {
+      "connection": { "name": "Connection" },
+      "alarm": { "name": "Alarm" },
+      "filter_warning": { "name": "Filter warning" }
     }
   },
   "services": {

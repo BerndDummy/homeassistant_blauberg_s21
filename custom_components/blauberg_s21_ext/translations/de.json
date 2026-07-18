@@ -57,6 +57,19 @@
                     "auto":  "Automatik Modus"
                 }
             }
+        },
+        "sensor": {
+            "intake_temperature_in": { "name": "Ansaugtemperatur Eingang" },
+            "intake_temperature_out": { "name": "Ansaugtemperatur Ausgang" },
+            "outlet_temperature_in": { "name": "Ablufttemperatur Eingang" },
+            "outlet_temperature_out": { "name": "Ablufttemperatur Ausgang" },
+            "incoming_air_pressure": { "name": "Zuluftdruck" },
+            "outgoing_air_pressure": { "name": "Abluftdruck" }
+        },
+        "binary_sensor": {
+            "connection": { "name": "Verbindung" },
+            "alarm": { "name": "Alarm" },
+            "filter_warning": { "name": "Filterwarnung" }
         }
     }
 }

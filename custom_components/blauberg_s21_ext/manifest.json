@@ -4,10 +4,10 @@
   "codeowners": ["@marni-xyz"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/marni-xyz/homeassistant_blauberg_s21",
+  "documentation": "https://github.com/BerndDummy/homeassistant_blauberg_s21",
   "integration_type": "device",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/marni-xyz/homeassistant_blauberg_s21/issues",
+  "issue_tracker": "https://github.com/BerndDummy/homeassistant_blauberg_s21/issues",
   "requirements": ["pybls21@git+https://github.com/marni-xyz/pybls21.git@v.4.6.1"],
-  "version": "4.6.1"
+  "version": "4.7.0"
 }

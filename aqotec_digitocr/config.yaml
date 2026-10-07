@@ -1,0 +1,26 @@
+name: "Aqotec DigitOCR Shadow"
+version: "0.1.0"
+slug: "aqotec_digitocr_shadow"
+description: "Parallel digit-only ONNX OCR for Aqotec power and flow; never writes to the existing Aqotec values."
+url: "https://github.com/BerndDummy/homeassistant_blauberg_s21"
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+init: false
+homeassistant_api: true
+hassio_api: false
+protected: true
+options:
+  camera_entity: "camera.wansview_apotec_profile1"
+  scan_interval: 30
+  min_digit_confidence: 0.40
+  stable_samples: 2
+  save_debug_crops: false
+schema:
+  camera_entity: str
+  scan_interval: int(20,600)
+  min_digit_confidence: float(0.0,1.0)
+  stable_samples: int(1,5)
+  save_debug_crops: bool

@@ -1,5 +1,5 @@
 name: "Aqotec DigitOCR Shadow"
-version: "0.1.9"
+version: "0.1.10"
 slug: "aqotec_digitocr_shadow"
 description: "Parallel digit-only ONNX OCR for Aqotec power and flow; never writes to the existing Aqotec values."
 url: "https://github.com/BerndDummy/homeassistant_blauberg_s21"

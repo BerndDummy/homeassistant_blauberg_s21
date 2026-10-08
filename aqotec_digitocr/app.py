@@ -32,8 +32,10 @@ FIELD_WINDOWS = {
     # Values appear at about 80% of the rectified screen width.
     # Exclude the kW/lph units further right. Tight vertical bands
     # prevent mixing adjacent LCD rows.
-    "power": (0.665, 0.395, 0.850, 0.500),
-    "flow": (0.585, 0.505, 0.850, 0.608),
+    # Right-aligned numerals on the rectified screen. The digit ends
+    # around x=0.93; v0.1.9 stopped at x=0.85 (before the numeral).
+    "power": (0.78, 0.404, 0.943, 0.491),
+    "flow": (0.78, 0.504, 0.943, 0.586),
 }
 
 CALIBRATION_WINDOWS = {
@@ -1094,9 +1096,24 @@ def main():
                 value, confidence, per_digit_conf, binary, diagnostics, norms = recognize_integer(
                     model, templates, crop, max_digits
                 )
+                # Require the last glyph to end at the Aqotec numeric
+                # right-alignment column, not at a cropped label/unit.
+                right_edges = [
+                    FIELD_WINDOWS[field][0] * WARP_W + d["box"][0] + d["box"][2]
+                    for d in diagnostics
+                ]
+                right_edge = max(right_edges) if right_edges else None
+                valid_alignment = (
+                    right_edge is not None
+                    and 0.895 * WARP_W <= right_edge <= 0.96 * WARP_W
+                )
+                if not valid_alignment:
+                    value, confidence = None, 0.0
                 results[field] = {
                     "value": value,
                     "confidence": confidence,
+                    "alignment_valid": valid_alignment,
+                    "right_edge": round(right_edge, 1) if right_edge is not None else None,
                     "digit_confidences": per_digit_conf,
                     "diagnostics": diagnostics,
                     "norms": norms,
@@ -1133,12 +1150,12 @@ def main():
             flow_stable = accepted_flow is not None and flow == accepted_flow
 
             status = "ok"
-            if accepted_power is None or accepted_flow is None:
-                status = "warming_up"
-            elif physically_impossible:
+            if physically_impossible:
                 status = "held_physical_inconsistency"
             elif power is None or flow is None:
                 status = "held_segmentation_error"
+            elif accepted_power is None or accepted_flow is None:
+                status = "warming_up"
             elif power_conf < safe_confidence or flow_conf < safe_confidence:
                 status = "held_low_confidence"
             elif not power_stable or not flow_stable:
@@ -1155,6 +1172,10 @@ def main():
                     "flow": accepted_flow,
                     "raw_power": power,
                     "raw_flow": flow,
+                    "power_alignment_valid": results["power"]["alignment_valid"],
+                    "flow_alignment_valid": results["flow"]["alignment_valid"],
+                    "power_right_edge": results["power"]["right_edge"],
+                    "flow_right_edge": results["flow"]["right_edge"],
                     "power_confidence": round(power_conf * 100.0, 1),
                     "flow_confidence": round(flow_conf * 100.0, 1),
                     "power_digit_confidences": [round(x * 100.0, 1) for x in results["power"]["digit_confidences"]],

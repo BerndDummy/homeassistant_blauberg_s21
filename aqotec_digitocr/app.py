@@ -26,8 +26,11 @@ WARP_H = 600
 FIELD_WINDOWS = {
     # Calibrated from the fixed Aqotec screen geometry. Earlier windows clipped
     # the lower edge of each LCD digit, which made a real 0 look like 8/1/7.
-    "power": (0.73, 0.370, 0.955, 0.495),
-    "flow": (0.73, 0.480, 0.955, 0.605),
+    # These rectangles cover only the number row after perspective rectification,
+    # not the energy row above or the primary-temperature row below.
+    # Measured against the camera view re-aligned on 2026-10-08.
+    "power": (0.80, 0.400, 0.955, 0.530),
+    "flow": (0.75, 0.515, 0.955, 0.630),
 }
 
 CALIBRATION_WINDOWS = {
@@ -107,7 +110,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.6",
+        "sw_version": "0.1.7",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -1000,14 +1003,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.6",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.7",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.6",
+            "source": "aqotec-digitocr-shadow-v1.7",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -1088,6 +1091,10 @@ def main():
             elif not power_stable or not flow_stable:
                 status = "held_unstable"
 
+            # Publish neither stale held values nor unverified measurements.
+            # Do not fabricate zeros when the camera/segmentation fails.
+            if status != "ok":
+                accepted_power, accepted_flow = None, None
             payload.update(
                 {
                     "status": status,

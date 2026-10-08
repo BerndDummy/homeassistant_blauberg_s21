@@ -68,6 +68,8 @@ def read_options():
         "min_digit_confidence": 0.40,
         "stable_samples": 2,
         "save_debug_crops": False,
+        "power_rect": "0.665,0.395,0.850,0.500",
+        "flow_rect": "0.585,0.505,0.850,0.608",
     }
     try:
         if OPTIONS_PATH.exists():
@@ -78,6 +80,17 @@ def read_options():
     defaults["stable_samples"] = max(1, min(5, int(defaults["stable_samples"])))
     defaults["min_digit_confidence"] = max(0.0, min(1.0, float(defaults["min_digit_confidence"])))
     defaults["save_debug_crops"] = bool(defaults["save_debug_crops"])
+    for field in ("power", "flow"):
+        key = field + "_rect"
+        try:
+            parts = [float(x.strip()) for x in str(defaults[key]).split(",")]
+            if len(parts) != 4 or not (0 <= parts[0] < parts[2] <= 1 and 0 <= parts[1] < parts[3] <= 1):
+                raise ValueError("invalid crop geometry")
+            if parts[2] - parts[0] < 0.06 or parts[3] - parts[1] < 0.045:
+                raise ValueError("crop region too small")
+            defaults[key + "_values"] = tuple(parts)
+        except Exception as exc:
+            raise ValueError(f"Invalid {key}: {exc}") from exc
     return defaults
 
 
@@ -113,7 +126,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.8",
+        "sw_version": "0.1.9",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -913,6 +926,37 @@ class SurveyHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if parsed.path == "/debug/geometry":
+            try:
+                opts = read_options()
+                frame = fetch_camera(opts["camera_entity"])
+                quad, mode, confidence = detect_screen_quad(frame)
+                if quad is None:
+                    self._json(200, {"ok": False, "geometry_mode": mode, "confidence": confidence})
+                    return
+                rectified = warp_screen(frame, quad)
+                preview = rectified.copy()
+                for field, color in (("power", (0, 255, 0)), ("flow", (0, 200, 255))):
+                    a, b, c, d = opts[field + "_rect_values"]
+                    pt1 = (int(a * WARP_W), int(b * WARP_H))
+                    pt2 = (int(c * WARP_W), int(d * WARP_H))
+                    cv2.rectangle(preview, pt1, pt2, color, 2)
+                    cv2.putText(preview, field, (pt1[0], max(18, pt1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 78])
+                if not ok:
+                    raise RuntimeError("debug_encode_failed")
+                self._json(200, {
+                    "ok": True,
+                    "geometry_mode": mode,
+                    "confidence": confidence,
+                    "quad_normalized": (quad / np.array([frame.shape[1], frame.shape[0]], dtype=np.float32)).tolist(),
+                    "field_windows": {field: list(opts[field + "_rect_values"]) for field in ("power", "flow")},
+                    "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                    "mime": "image/jpeg",
+                })
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
         if parsed.path == "/survey/list":
             self._json(
                 200,
@@ -1012,14 +1056,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.8",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.9",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.8",
+            "source": "aqotec-digitocr-shadow-v1.9",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -1045,7 +1089,7 @@ def main():
 
             results = {}
             for field in ("power", "flow"):
-                crop = field_crop(screen, field)
+                crop = crop_rect(screen, options[field + "_rect_values"])
                 max_digits = 2 if field == "power" else 4
                 value, confidence, per_digit_conf, binary, diagnostics, norms = recognize_integer(
                     model, templates, crop, max_digits
@@ -1131,6 +1175,7 @@ def main():
                     "screen_confidence": screen_conf,
                     "physical_plausibility_pass": not physically_impossible,
                     "geometry_mode": "dynamic_quad",
+                    "field_windows": {k: list(options[k + "_rect_values"]) for k in ("power", "flow")},
                     "required_stable_samples": safe_samples,
                     "model": "mnist-12.onnx + learned Aqotec font templates",
                     "template_counts": templates.counts(),

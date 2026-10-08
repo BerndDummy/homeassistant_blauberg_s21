@@ -943,8 +943,8 @@ class SurveyHandler(BaseHTTPRequestHandler):
                     pt2 = (int(c * WARP_W), int(d * WARP_H))
                     cv2.rectangle(preview, pt1, pt2, color, 2)
                     cv2.putText(preview, field, (pt1[0], max(18, pt1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                preview = cv2.resize(preview, (650, 390), interpolation=cv2.INTER_AREA)
-                ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 40])
+                preview = cv2.resize(preview, (400, 240), interpolation=cv2.INTER_AREA)
+                ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 25])
                 if not ok:
                     raise RuntimeError("debug_encode_failed")
                 self._json(200, {

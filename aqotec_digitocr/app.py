@@ -630,11 +630,8 @@ def recognize_integer(model, templates, crop, max_digits=3):
     if not items:
         return None, 0.0, [], binary, [], []
 
-    # Reject cut-off digits: OCR of clipped 0/8 creates false spikes.
-    h, w = binary.shape[:2]
-    for _, _, (x, y, bw, bh, area) in items:
-        if y <= 3 or y + bh >= h - 3 or x <= 2 or x + bw >= w - 2:
-            return None, 0.0, [], binary, [], []
+    # Do not reject legitimate glyphs at the artificial preprocessing
+    # border. Reliability is enforced by multi-sample and hydraulic checks.
 
     digits = []
     confidences = []
@@ -944,7 +941,8 @@ class SurveyHandler(BaseHTTPRequestHandler):
                     pt2 = (int(c * WARP_W), int(d * WARP_H))
                     cv2.rectangle(preview, pt1, pt2, color, 2)
                     cv2.putText(preview, field, (pt1[0], max(18, pt1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 78])
+                preview = cv2.resize(preview, (650, 390), interpolation=cv2.INTER_AREA)
+                ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 40])
                 if not ok:
                     raise RuntimeError("debug_encode_failed")
                 self._json(200, {

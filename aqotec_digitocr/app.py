@@ -610,7 +610,7 @@ def main():
 
     options = read_options()
     templates = FontTemplates()
-    model = DigitModel()
+    model = None  # Load ONNX only when a non-zero reading actually appears.
     stability = {"power": Stability(), "flow": Stability()}
     publish_discovery()
 
@@ -650,10 +650,9 @@ def main():
             for field in ("power", "flow"):
                 crop = crop_rect(screen, FIELD_WINDOWS[field])
                 max_digits = 2 if field == "power" else 4
-                value, confidence, per_digit_conf, binary, diagnostics, norms = recognize_integer(
-                    model, templates, crop, max_digits
-                )
-                # Verify the obvious on-screen zero before trusting generic ONNX.
+                # Check a known single zero first. Most idle scans need no
+                # ONNX model or generic digit classification at all.
+                binary = make_binary(crop)
                 boxes = digit_boxes(binary, max_digits)
                 is_zero, zero_score = recognize_zero(binary, boxes, field)
                 if is_zero:
@@ -665,6 +664,12 @@ def main():
                         "source": "fixed_zero_reference",
                         "confidence": round(confidence * 100.0, 1),
                     }]
+                else:
+                    if model is None:
+                        model = DigitModel()
+                    value, confidence, per_digit_conf, binary, diagnostics, norms = recognize_integer(
+                        model, templates, crop, max_digits
+                    )
 
                 # Require the last glyph to end at the Aqotec numeric
                 # right-alignment column, not at a cropped label/unit.

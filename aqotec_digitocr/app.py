@@ -29,8 +29,11 @@ FIELD_WINDOWS = {
     # These rectangles cover only the number row after perspective rectification,
     # not the energy row above or the primary-temperature row below.
     # Measured against the camera view re-aligned on 2026-10-08.
-    "power": (0.80, 0.400, 0.955, 0.530),
-    "flow": (0.75, 0.515, 0.955, 0.630),
+    # Values appear at about 80% of the rectified screen width.
+    # Exclude the kW/lph units further right. Tight vertical bands
+    # prevent mixing adjacent LCD rows.
+    "power": (0.665, 0.395, 0.850, 0.500),
+    "flow": (0.585, 0.505, 0.850, 0.608),
 }
 
 CALIBRATION_WINDOWS = {
@@ -110,7 +113,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.7",
+        "sw_version": "0.1.8",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -612,6 +615,12 @@ def recognize_integer(model, templates, crop, max_digits=3):
     if not items:
         return None, 0.0, [], binary, [], []
 
+    # Reject cut-off digits: OCR of clipped 0/8 creates false spikes.
+    h, w = binary.shape[:2]
+    for _, _, (x, y, bw, bh, area) in items:
+        if y <= 3 or y + bh >= h - 3 or x <= 2 or x + bw >= w - 2:
+            return None, 0.0, [], binary, [], []
+
     digits = []
     confidences = []
     diagnostics = []
@@ -1003,14 +1012,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.7",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.8",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.7",
+            "source": "aqotec-digitocr-shadow-v1.8",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }

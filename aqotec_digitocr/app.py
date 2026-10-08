@@ -128,7 +128,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.11",
+        "sw_version": "0.1.12",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -1058,14 +1058,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.11",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.12",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.11",
+            "source": "aqotec-digitocr-shadow-v1.12",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -1133,13 +1133,16 @@ def main():
                 # Require the last glyph to end at the Aqotec numeric
                 # right-alignment column, not at a cropped label/unit.
                 right_edges = [
-                    FIELD_WINDOWS[field][0] * WARP_W + d["box"][0] + d["box"][2]
+                    options[field + "_rect_values"][0] * WARP_W + d["box"][0] + d["box"][2]
                     for d in diagnostics
                 ]
                 right_edge = max(right_edges) if right_edges else None
+                # In the live rectified LCD image, the number columns end
+                # around x=0.825. The neighboring units begin near 0.86.
+                # v0.1.11 checked 0.895..0.96 and rejected correct zeros.
                 valid_alignment = (
                     right_edge is not None
-                    and 0.895 * WARP_W <= right_edge <= 0.96 * WARP_W
+                    and 0.775 * WARP_W <= right_edge <= 0.865 * WARP_W
                 )
                 if not valid_alignment:
                     value, confidence = None, 0.0

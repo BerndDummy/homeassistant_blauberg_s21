@@ -22,19 +22,11 @@ WARP_H = 600
 
 # Normalized field windows in the rectified Aqotec display.
 # Only the numeric portion is included; units are intentionally excluded.
+# One source of truth: rectified Aqotec power and flow number rows.
+# Camera fixed in position on 2026-10-08. No automatic moving windows.
 FIELD_WINDOWS = {
-    # Calibrated from the fixed Aqotec screen geometry. Earlier windows clipped
-    # the lower edge of each LCD digit, which made a real 0 look like 8/1/7.
-    # These rectangles cover only the number row after perspective rectification,
-    # not the energy row above or the primary-temperature row below.
-    # Measured against the camera view re-aligned on 2026-10-08.
-    # Values appear at about 80% of the rectified screen width.
-    # Exclude the kW/lph units further right. Tight vertical bands
-    # prevent mixing adjacent LCD rows.
-    # Right-aligned numerals on the rectified screen. The digit ends
-    # around x=0.93; v0.1.11 stopped at x=0.85 (before the numeral).
-    "power": (0.78, 0.404, 0.943, 0.491),
-    "flow": (0.78, 0.504, 0.943, 0.586),
+    "power": (0.755, 0.375, 0.940, 0.505),
+    "flow": (0.755, 0.490, 0.940, 0.600),
 }
 
 TEMPLATE_ROOT = Path("/data/font_templates")
@@ -51,10 +43,6 @@ def read_options():
     defaults = {
         "camera_entity": "camera.wansview_apotec_profile1",
         "scan_interval": 30,
-        "min_digit_confidence": 0.40,
-        "stable_samples": 2,
-        "power_rect": "0.755,0.377,0.940,0.498",
-        "flow_rect": "0.755,0.492,0.940,0.595",
     }
     try:
         if OPTIONS_PATH.exists():
@@ -62,19 +50,6 @@ def read_options():
     except Exception as exc:
         log("options_error", error=str(exc))
     defaults["scan_interval"] = max(20, min(600, int(defaults["scan_interval"])))
-    defaults["stable_samples"] = max(1, min(5, int(defaults["stable_samples"])))
-    defaults["min_digit_confidence"] = max(0.0, min(1.0, float(defaults["min_digit_confidence"])))
-    for field in ("power", "flow"):
-        key = field + "_rect"
-        try:
-            parts = [float(x.strip()) for x in str(defaults[key]).split(",")]
-            if len(parts) != 4 or not (0 <= parts[0] < parts[2] <= 1 and 0 <= parts[1] < parts[3] <= 1):
-                raise ValueError("invalid crop geometry")
-            if parts[2] - parts[0] < 0.06 or parts[3] - parts[1] < 0.045:
-                raise ValueError("crop region too small")
-            defaults[key + "_values"] = tuple(parts)
-        except Exception as exc:
-            raise ValueError(f"Invalid {key}: {exc}") from exc
     return defaults
 
 
@@ -673,7 +648,7 @@ def main():
             }
             results = {}
             for field in ("power", "flow"):
-                crop = crop_rect(screen, options[field + "_rect_values"])
+                crop = crop_rect(screen, FIELD_WINDOWS[field])
                 max_digits = 2 if field == "power" else 4
                 value, confidence, per_digit_conf, binary, diagnostics, norms = recognize_integer(
                     model, templates, crop, max_digits
@@ -694,7 +669,7 @@ def main():
                 # Require the last glyph to end at the Aqotec numeric
                 # right-alignment column, not at a cropped label/unit.
                 right_edges = [
-                    options[field + "_rect_values"][0] * WARP_W + d["box"][0] + d["box"][2]
+                    FIELD_WINDOWS[field][0] * WARP_W + d["box"][0] + d["box"][2]
                     for d in diagnostics
                 ]
                 right_edge = max(right_edges) if right_edges else None
@@ -732,8 +707,8 @@ def main():
             )
             if physically_impossible:
                 power, flow = None, None
-            safe_confidence = max(0.75, options["min_digit_confidence"])
-            safe_samples = max(3, options["stable_samples"])
+            safe_confidence = 0.75
+            safe_samples = 3
             accepted_power, power_changed = stability["power"].update(
                 power, power_conf, safe_confidence, safe_samples
             )

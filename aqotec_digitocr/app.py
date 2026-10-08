@@ -33,7 +33,7 @@ FIELD_WINDOWS = {
     # Exclude the kW/lph units further right. Tight vertical bands
     # prevent mixing adjacent LCD rows.
     # Right-aligned numerals on the rectified screen. The digit ends
-    # around x=0.93; v0.1.10 stopped at x=0.85 (before the numeral).
+    # around x=0.93; v0.1.11 stopped at x=0.85 (before the numeral).
     "power": (0.78, 0.404, 0.943, 0.491),
     "flow": (0.78, 0.504, 0.943, 0.586),
 }
@@ -128,7 +128,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.10",
+        "sw_version": "0.1.11",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -246,10 +246,12 @@ def fixed_screen_quad(image):
     h, w = image.shape[:2]
     return np.array(
         [
-            [0.346 * w, 0.275 * h],
-            [0.938 * w, 0.254 * h],
-            [0.956 * w, 0.880 * h],
-            [0.337 * w, 0.896 * h],
+            # Locked Aqotec LCD geometry from the stationary camera
+            # recalibration on 2026-10-08 (perspective quadrilateral).
+            [0.382 * w, 0.065 * h],
+            [0.958 * w, 0.105 * h],
+            [0.968 * w, 0.695 * h],
+            [0.363 * w, 0.653 * h],
         ],
         dtype=np.float32,
     )
@@ -1056,23 +1058,36 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.10",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.11",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.10",
+            "source": "aqotec-digitocr-shadow-v1.11",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
         try:
             image = fetch_camera(options["camera_entity"])
-            quad, screen_mode, screen_conf = detect_screen_quad(image)
-            if quad is None or screen_mode != "auto" or screen_conf < 0.30:
+            # Stabilize the rectification: mask-based LCD detection is
+            # noisy on blue bloom and used to shift the numeric rows by
+            # dozens of pixels from scan to scan. Its role is now only
+            # verifying the fixed physical camera position.
+            candidate_quad, candidate_mode, screen_conf = detect_screen_quad(image)
+            if candidate_quad is None or candidate_mode != "auto" or screen_conf < 0.30:
                 raise RuntimeError("aqotec_screen_geometry_unreliable")
+            quad = fixed_screen_quad(image)
+            distances = np.linalg.norm(
+                (candidate_quad - quad) /
+                np.array([[image.shape[1], image.shape[0]]], dtype=np.float32),
+                axis=1,
+            )
+            if float(max(distances)) > 0.13:
+                raise RuntimeError("aqotec_camera_geometry_changed")
+            screen_mode = "locked_verified"
             screen = warp_screen(image, quad)
             # Lightweight geometry-only diagnostics (no stored screenshots).
             # Used to locate the LCD numbers in the *actual* camera warp.
@@ -1128,9 +1143,18 @@ def main():
                 )
                 if not valid_alignment:
                     value, confidence = None, 0.0
+                # Expose only bounded geometry diagnostics, no debug images.
+                cc, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+                raw_components = [
+                    [int(x), int(y), int(w), int(h), int(area)]
+                    for x, y, w, h, area in stats[1:]
+                    if area >= 20
+                ][:10]
                 results[field] = {
                     "value": value,
                     "confidence": confidence,
+                    "raw_components": raw_components,
+                    "foreground_fraction": round(float(np.count_nonzero(binary)) / max(1, binary.size), 3),
                     "alignment_valid": valid_alignment,
                     "right_edge": round(right_edge, 1) if right_edge is not None else None,
                     "digit_confidences": per_digit_conf,
@@ -1195,6 +1219,10 @@ def main():
                     "flow_alignment_valid": results["flow"]["alignment_valid"],
                     "power_right_edge": results["power"]["right_edge"],
                     "flow_right_edge": results["flow"]["right_edge"],
+                    "power_raw_components": results["power"]["raw_components"],
+                    "flow_raw_components": results["flow"]["raw_components"],
+                    "power_foreground_fraction": results["power"]["foreground_fraction"],
+                    "flow_foreground_fraction": results["flow"]["foreground_fraction"],
                     "power_confidence": round(power_conf * 100.0, 1),
                     "flow_confidence": round(flow_conf * 100.0, 1),
                     "power_digit_confidences": [round(x * 100.0, 1) for x in results["power"]["digit_confidences"]],
@@ -1240,6 +1268,10 @@ def main():
             geometry_confidence=payload.get("screen_confidence"),
             physical_plausibility_pass=payload.get("physical_plausibility_pass"),
             status=payload.get("status"),
+            power_raw_components=payload.get("power_raw_components"),
+            flow_raw_components=payload.get("flow_raw_components"),
+            power_foreground_fraction=payload.get("power_foreground_fraction"),
+            flow_foreground_fraction=payload.get("flow_foreground_fraction"),
             quad_norm=quad_norm if "quad_norm" in locals() else None,
             probe_boxes=probe_boxes if "probe_boxes" in locals() else None,
             power=payload.get("power"),

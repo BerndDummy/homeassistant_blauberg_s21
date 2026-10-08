@@ -1,12 +1,11 @@
 import base64
+import zlib
 import json
 import math
 import os
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import quote
 
 import cv2
 import numpy as np
@@ -38,22 +37,7 @@ FIELD_WINDOWS = {
     "flow": (0.78, 0.504, 0.943, 0.586),
 }
 
-CALIBRATION_WINDOWS = {
-    "energy": (0.64, 0.265, 0.95, 0.385),
-    "vorlauf": (0.75, 0.590, 0.955, 0.710),
-    "ruecklauf": (0.75, 0.690, 0.955, 0.815),
-    "spread": (0.76, 0.805, 0.955, 0.925),
-}
-
 TEMPLATE_ROOT = Path("/data/font_templates")
-SURVEY_ROOT = Path("/data/survey")
-SURVEY_PORT = 8099
-SURVEY_INTERVAL = 1.2
-SURVEY_MAX_FILES = 80
-survey_active = False
-survey_last_hash = None
-survey_lock = threading.Lock()
-
 SESSION = requests.Session()
 SESSION.headers.update({"Authorization": f"Bearer {TOKEN}"})
 
@@ -69,9 +53,8 @@ def read_options():
         "scan_interval": 30,
         "min_digit_confidence": 0.40,
         "stable_samples": 2,
-        "save_debug_crops": False,
-        "power_rect": "0.665,0.395,0.850,0.500",
-        "flow_rect": "0.585,0.505,0.850,0.608",
+        "power_rect": "0.755,0.377,0.940,0.498",
+        "flow_rect": "0.755,0.492,0.940,0.595",
     }
     try:
         if OPTIONS_PATH.exists():
@@ -81,7 +64,6 @@ def read_options():
     defaults["scan_interval"] = max(20, min(600, int(defaults["scan_interval"])))
     defaults["stable_samples"] = max(1, min(5, int(defaults["stable_samples"])))
     defaults["min_digit_confidence"] = max(0.0, min(1.0, float(defaults["min_digit_confidence"])))
-    defaults["save_debug_crops"] = bool(defaults["save_debug_crops"])
     for field in ("power", "flow"):
         key = field + "_rect"
         try:
@@ -128,7 +110,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.12",
+        "sw_version": "0.1.13",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -257,80 +239,6 @@ def fixed_screen_quad(image):
     )
 
 
-def detect_screen_quad(image):
-    h, w = image.shape[:2]
-    b, g, r = cv2.split(image)
-    bi = b.astype(np.int16)
-    gi = g.astype(np.int16)
-    ri = r.astype(np.int16)
-
-    # Aqotec display is distinctly blue/cyan compared with the surrounding wood.
-    mask = (
-        (bi > 80)
-        & (bi - ri > 8)
-        & (bi >= gi - 8)
-    ).astype(np.uint8) * 255
-
-    # Ignore zones where the display cannot be in this fixed camera installation.
-    # The camera can be tilted/shifted. Keep the top 18% available:
-    # the screen is presently above that line. Ignore only image margins.
-    mask[: int(0.025 * h), :] = 0
-    mask[:, : int(0.12 * w)] = 0
-
-    close_k = max(9, int(min(h, w) * 0.025) | 1)
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8)
-    )
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)
-    )
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_score = 0.0
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        area_ratio = area / float(w * h)
-        if area_ratio < 0.06 or area_ratio > 0.65:
-            continue
-
-        rect = cv2.minAreaRect(contour)
-        rw, rh = rect[1]
-        if rw < 1 or rh < 1:
-            continue
-        aspect = max(rw, rh) / min(rw, rh)
-        if not 1.25 <= aspect <= 2.8:
-            continue
-
-        cx, cy = rect[0]
-        if cx < 0.25 * w or cy < 0.20 * h:
-            continue
-
-        perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
-        if len(approx) == 4:
-            quad = approx.reshape(4, 2).astype(np.float32)
-        else:
-            quad = cv2.boxPoints(rect).astype(np.float32)
-
-        rect_area = max(1.0, rw * rh)
-        rectangularity = min(1.0, area / rect_area)
-        aspect_score = max(0.0, 1.0 - abs(aspect - 1.75) / 1.75)
-        score = area_ratio * (0.5 + 0.5 * rectangularity) * (0.6 + 0.4 * aspect_score)
-
-        if score > best_score:
-            best_score = score
-            best = quad
-
-    # Never fall back to obsolete fixed coordinates after camera movement.
-    # An uncertain frame must produce no new shadow measurement.
-    if best is None or best_score < 0.055:
-        return None, "not_found", 0.0
-
-    return order_quad(best), "auto", round(min(1.0, best_score / 0.25), 3)
-
-
 def warp_screen(image, quad):
     src = order_quad(quad)
     dst = np.array(
@@ -364,8 +272,8 @@ def make_binary(crop):
     _, binary = cv2.threshold(red, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     foreground_ratio = float(np.count_nonzero(binary)) / float(binary.size)
-    if foreground_ratio > 0.32:
-        binary = cv2.bitwise_not(binary)
+    if foreground_ratio > 0.45:
+        return np.zeros_like(binary)
 
     # Suppress isolated camera/compression speckles but keep the LCD glyph holes.
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
@@ -535,25 +443,6 @@ class FontTemplates:
         margin = best_score - second_score
         return best_digit, best_score, margin
 
-    def learn(self, digit, norm):
-        digit = int(digit)
-        if digit < 0 or digit > 9:
-            return False
-        existing = self.bank[digit]
-        if existing:
-            same = max(self._score(norm, x) for x in existing)
-            if same >= 0.985:
-                return False
-        if len(existing) >= 12:
-            return False
-        folder = TEMPLATE_ROOT / str(digit)
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{int(time.time() * 1000)}.png"
-        if not cv2.imwrite(str(path), norm):
-            return False
-        existing.append(norm.copy())
-        return True
-
     def counts(self):
         return {str(d): len(v) for d, v in self.bank.items() if v}
 
@@ -684,112 +573,32 @@ def recognize_integer(model, templates, crop, max_digits=3):
     return value, confidence, confidences, binary, diagnostics, norms
 
 
-def extract_expected_glyphs(crop, expected_count):
-    binary, items = extract_glyphs(crop, max(1, expected_count + 1))
-    if len(items) == expected_count:
-        return [item[0] for item in items], "components"
-
-    # Calibration fallback for the fixed-width Aqotec bitmap font. Remove
-    # decimal points/speckles, then split the right-aligned numeric run near
-    # equal pitch boundaries. This is only used to LEARN templates from fields
-    # whose value is already known from the existing independent pipeline.
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-    clean = np.zeros_like(binary)
-    h, w = binary.shape[:2]
-    for idx in range(1, count):
-        x, y, bw, bh, area = [int(v) for v in stats[idx]]
-        if bh >= int(0.32 * h) and area >= 10:
-            clean[labels == idx] = 255
-
-    cols = np.count_nonzero(clean, axis=0)
-    active = np.where(cols >= max(1, int(0.06 * h)))[0]
-    if len(active) < expected_count * 3:
-        return [], "none"
-
-    left, right = int(active.min()), int(active.max())
-    pitch = (right - left + 1) / float(expected_count)
-    boundaries = [left]
-    for i in range(1, expected_count):
-        nominal = left + i * pitch
-        radius = max(2, int(0.28 * pitch))
-        lo = max(boundaries[-1] + 2, int(nominal - radius))
-        hi = min(right - 2, int(nominal + radius))
-        if hi <= lo:
-            return [], "none"
-        split = min(range(lo, hi + 1), key=lambda x: int(cols[x]))
-        boundaries.append(split)
-    boundaries.append(right + 1)
-
-    norms = []
-    for i in range(expected_count):
-        sx1, sx2 = boundaries[i], boundaries[i + 1]
-        if sx2 - sx1 < 3:
-            return [], "none"
-        segment = clean[:, sx1:sx2]
-        ys, xs = np.where(segment > 0)
-        if len(xs) == 0:
-            return [], "none"
-        box = (sx1, int(ys.min()), sx2 - sx1, int(ys.max() - ys.min() + 1), int(len(xs)))
-        norm, glyph = normalize_digit(clean, box)
-        if norm is None or glyph is None:
-            return [], "none"
-        norms.append(norm)
-    return norms, "pitch_split"
+# Two fixed zero-glyph samples from the user's Aqotec camera (2026-10-08).
+# No automatic training, image storage or survey recording.
+ZERO_TEMPLATES = {
+    "power": "c-qa<F%AGA2m`?O|DSdsy0s-TXh+W|3cxpEW$Fw}uVP2XU5$J7))CGx?>>O;d%T}gba#wHI$Eypj~zntFd=!u#{M7+=~w{s",
+    "flow": "c-qa<F%AGA2m`?O|DSfX1`6sz*CR$kff3=6%K75^WZ?Qz;>?}$kI?Cz-q~|_mu<VQdmG26e;xRuLB4`jNvjqYjyYM&#Q|3",
+}
 
 
-def expected_digits(value, decimals=0):
-    if value is None:
-        return None
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-    if decimals == 0:
-        return str(int(round(abs(value))))
-    scaled = int(round(abs(value) * (10 ** decimals)))
-    return str(scaled)
-
-
-def calibrate_templates(screen, templates, values):
-    specs = [
-        ("energy", values.get("energy"), 0),
-        ("vorlauf", values.get("vorlauf"), 1),
-        ("ruecklauf", values.get("ruecklauf"), 1),
-        ("spread", values.get("spread"), 1),
-    ]
-    learned = []
-    diagnostics = {}
-    for name, raw_value, decimals in specs:
-        label = expected_digits(raw_value, decimals)
-        if not label:
-            continue
-        crop = crop_rect(screen, CALIBRATION_WINDOWS[name])
-        norms, mode = extract_expected_glyphs(crop, len(label))
-        diagnostics[name] = {
-            "label": label,
-            "glyphs": len(norms),
-            "mode": mode,
-        }
-        if len(norms) != len(label):
-            continue
-        for char, norm in zip(label, norms):
-            if templates.learn(int(char), norm):
-                learned.append(int(char))
-
-    # Bootstrap zero only until a small stable seed exists. We never keep
-    # teaching "0" forever from a potentially stale helper value.
-    if (
-        len(templates.bank[0]) < 4
-        and values.get("power") == 0.0
-        and values.get("flow") == 0.0
-    ):
-        for name in ("power", "flow"):
-            crop = field_crop(screen, name)
-            _, items = extract_glyphs(crop, 2)
-            if len(items) == 1:
-                if templates.learn(0, items[0][0]):
-                    learned.append(0)
-    return learned, diagnostics
+def recognize_zero(binary, boxes, field):
+    if len(boxes) != 1:
+        return False, 0.0
+    x, y, w, h, _ = boxes[0]
+    # Only a complete, right-aligned single digit may match the zero reference.
+    if not (22 <= w <= 58 and 30 <= h <= 90):
+        return False, 0.0
+    glyph = binary[y:y+h, x:x+w]
+    height, width = glyph.shape
+    scale = min(24.0 / width, 24.0 / height)
+    w2, h2 = max(1, round(width * scale)), max(1, round(height * scale))
+    resized = cv2.resize(glyph, (w2, h2), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((32, 32), dtype=np.uint8)
+    dx, dy = (32 - w2) // 2, (32 - h2) // 2
+    canvas[dy:dy+h2, dx:dx+w2] = resized
+    reference = np.frombuffer(zlib.decompress(base64.b85decode(ZERO_TEMPLATES[field])), np.uint8).reshape(32, 32)
+    score = float(cv2.matchTemplate(canvas, reference, cv2.TM_CCOEFF_NORMED)[0, 0])
+    return score >= 0.86, score
 
 
 class Stability:
@@ -820,235 +629,11 @@ class Stability:
         return self.accepted, newly_accepted
 
 
-def save_debug(name, crop, binary):
-    root = Path("/data/debug")
-    root.mkdir(parents=True, exist_ok=True)
-    stamp = int(time.time())
-    cv2.imwrite(str(root / f"{stamp}_{name}_crop.jpg"), crop)
-    cv2.imwrite(str(root / f"{stamp}_{name}_binary.png"), binary)
-    files = sorted(root.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in files[40:]:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-
-
-
-def survey_hash(screen):
-    gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
-    small = cv2.resize(gray, (32, 18), interpolation=cv2.INTER_AREA)
-    small = cv2.GaussianBlur(small, (3, 3), 0)
-    return (small > np.median(small)).astype(np.uint8).reshape(-1)
-
-
-def hash_distance(a, b):
-    if a is None or b is None:
-        return 999
-    return int(np.count_nonzero(a != b))
-
-
-def survey_capture_loop(camera_entity):
-    global survey_last_hash
-    SURVEY_ROOT.mkdir(parents=True, exist_ok=True)
-    while True:
-        if not survey_active:
-            time.sleep(0.25)
-            continue
-        try:
-            image = fetch_camera(camera_entity)
-            screen = warp_screen(image, fixed_screen_quad(image))
-            hsh = survey_hash(screen)
-            with survey_lock:
-                distance = hash_distance(survey_last_hash, hsh)
-                # A page change alters a large portion of the screen. Ignore tiny
-                # live-value flicker so a 3-second hold does not create duplicates.
-                if survey_last_hash is None or distance >= 26:
-                    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-                    ms = int((time.time() % 1) * 1000)
-                    path = SURVEY_ROOT / f"{stamp}_{ms:03d}.jpg"
-                    cv2.imwrite(
-                        str(path),
-                        screen,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), 78],
-                    )
-                    survey_last_hash = hsh
-                    files = sorted(
-                        SURVEY_ROOT.glob("*.jpg"),
-                        key=lambda p: p.stat().st_mtime,
-                        reverse=True,
-                    )
-                    for old in files[SURVEY_MAX_FILES:]:
-                        try:
-                            old.unlink()
-                        except OSError:
-                            pass
-                    log("survey_capture", file=path.name, change_bits=distance)
-        except Exception as exc:
-            log("survey_capture_error", error=str(exc))
-        time.sleep(SURVEY_INTERVAL)
-
-
-def survey_files():
-    SURVEY_ROOT.mkdir(parents=True, exist_ok=True)
-    files = sorted(SURVEY_ROOT.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
-    return [
-        {
-            "name": p.name,
-            "size": p.stat().st_size,
-            "mtime": p.stat().st_mtime,
-        }
-        for p in files
-    ]
-
-
-class SurveyHandler(BaseHTTPRequestHandler):
-    def _json(self, status, payload):
-        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def log_message(self, fmt, *args):
-        return
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path in ("/", "/health"):
-            self._json(
-                200,
-                {
-                    "ok": True,
-                    "survey_active": survey_active,
-                    "interval_s": SURVEY_INTERVAL,
-                    "files": len(survey_files()),
-                },
-            )
-            return
-        if parsed.path == "/debug/geometry":
-            try:
-                opts = read_options()
-                frame = fetch_camera(opts["camera_entity"])
-                quad, mode, confidence = detect_screen_quad(frame)
-                if quad is None:
-                    self._json(200, {"ok": False, "geometry_mode": mode, "confidence": confidence})
-                    return
-                rectified = warp_screen(frame, quad)
-                preview = rectified.copy()
-                for field, color in (("power", (0, 255, 0)), ("flow", (0, 200, 255))):
-                    a, b, c, d = opts[field + "_rect_values"]
-                    pt1 = (int(a * WARP_W), int(b * WARP_H))
-                    pt2 = (int(c * WARP_W), int(d * WARP_H))
-                    cv2.rectangle(preview, pt1, pt2, color, 2)
-                    cv2.putText(preview, field, (pt1[0], max(18, pt1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                preview = cv2.resize(preview, (400, 240), interpolation=cv2.INTER_AREA)
-                ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 25])
-                if not ok:
-                    raise RuntimeError("debug_encode_failed")
-                self._json(200, {
-                    "ok": True,
-                    "geometry_mode": mode,
-                    "confidence": confidence,
-                    "quad_normalized": (quad / np.array([frame.shape[1], frame.shape[0]], dtype=np.float32)).tolist(),
-                    "field_windows": {field: list(opts[field + "_rect_values"]) for field in ("power", "flow")},
-                    "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
-                    "mime": "image/jpeg",
-                })
-            except Exception as exc:
-                self._json(500, {"ok": False, "error": str(exc)})
-            return
-        if parsed.path == "/survey/list":
-            self._json(
-                200,
-                {
-                    "active": survey_active,
-                    "interval_s": SURVEY_INTERVAL,
-                    "files": survey_files(),
-                },
-            )
-            return
-        if parsed.path == "/survey/image":
-            params = parse_qs(parsed.query)
-            name = (params.get("name") or [""])[0]
-            if not name or Path(name).name != name:
-                self._json(400, {"error": "invalid_name"})
-                return
-            path = SURVEY_ROOT / name
-            if not path.exists():
-                self._json(404, {"error": "not_found"})
-                return
-            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-            self._json(
-                200,
-                {
-                    "name": name,
-                    "mime": "image/jpeg",
-                    "base64": encoded,
-                },
-            )
-            return
-        self._json(404, {"error": "not_found"})
-
-    def do_POST(self):
-        global survey_active, survey_last_hash
-        parsed = urlparse(self.path)
-        if parsed.path == "/survey/start":
-            with survey_lock:
-                survey_last_hash = None
-            survey_active = True
-            self._json(
-                200,
-                {
-                    "ok": True,
-                    "active": True,
-                    "interval_s": SURVEY_INTERVAL,
-                    "instruction": "Hold each page for about 3 seconds.",
-                },
-            )
-            return
-        if parsed.path == "/survey/stop":
-            survey_active = False
-            self._json(200, {"ok": True, "active": False, "files": len(survey_files())})
-            return
-        if parsed.path == "/survey/clear":
-            survey_active = False
-            with survey_lock:
-                survey_last_hash = None
-                for path in SURVEY_ROOT.glob("*.jpg"):
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
-            self._json(200, {"ok": True, "active": False, "files": 0})
-            return
-        self._json(404, {"error": "not_found"})
-
-
-def start_survey_server(camera_entity):
-    SURVEY_ROOT.mkdir(parents=True, exist_ok=True)
-    threading.Thread(
-        target=survey_capture_loop,
-        args=(camera_entity,),
-        daemon=True,
-        name="survey-capture",
-    ).start()
-    server = ThreadingHTTPServer(("0.0.0.0", SURVEY_PORT), SurveyHandler)
-    threading.Thread(
-        target=server.serve_forever,
-        daemon=True,
-        name="survey-api",
-    ).start()
-    log("survey_server_started", port=SURVEY_PORT, interval_s=SURVEY_INTERVAL)
-
-
 def main():
     if not TOKEN:
         raise RuntimeError("SUPERVISOR_TOKEN_missing")
 
     options = read_options()
-    start_survey_server(options["camera_entity"])
     templates = FontTemplates()
     model = DigitModel()
     stability = {"power": Stability(), "flow": Stability()}
@@ -1058,71 +643,34 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.12",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.13",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.12",
+            "source": "aqotec-digitocr-shadow-v1.13",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
         try:
             image = fetch_camera(options["camera_entity"])
-            # Stabilize the rectification: mask-based LCD detection is
-            # noisy on blue bloom and used to shift the numeric rows by
-            # dozens of pixels from scan to scan. Its role is now only
-            # verifying the fixed physical camera position.
-            candidate_quad, candidate_mode, screen_conf = detect_screen_quad(image)
-            if candidate_quad is None or candidate_mode != "auto" or screen_conf < 0.30:
-                raise RuntimeError("aqotec_screen_geometry_unreliable")
-            quad = fixed_screen_quad(image)
-            distances = np.linalg.norm(
-                (candidate_quad - quad) /
-                np.array([[image.shape[1], image.shape[0]]], dtype=np.float32),
-                axis=1,
+            screen = warp_screen(image, fixed_screen_quad(image))
+            # Fail closed if the blue display is absent or camera moved away.
+            roi = screen[120:500, 120:780]
+            blue_minus_red = np.median(
+                roi[:, :, 0].astype(np.int16) - roi[:, :, 2].astype(np.int16)
             )
-            if float(max(distances)) > 0.13:
-                raise RuntimeError("aqotec_camera_geometry_changed")
-            screen_mode = "locked_verified"
-            screen = warp_screen(image, quad)
-            # Lightweight geometry-only diagnostics (no stored screenshots).
-            # Used to locate the LCD numbers in the *actual* camera warp.
-            probe_rect = (0.65, 0.27, 0.97, 0.66)
-            probe = crop_rect(screen, probe_rect)
-            probe_mask = make_binary(probe)
-            pn, _, pstats, _ = cv2.connectedComponentsWithStats(probe_mask, 8)
-            probe_boxes = []
-            for x0, y0, bw, bh, area in pstats[1:]:
-                if area >= 45 and bh >= 15:
-                    probe_boxes.append([
-                        round(float(0.65 * WARP_W + x0)),
-                        round(float(0.27 * WARP_H + y0)),
-                        int(bw), int(bh), int(area)
-                    ])
-            probe_boxes.sort(key=lambda b: (b[1], b[0]))
-            probe_boxes = probe_boxes[:28]
-            quad_norm = [
-                [round(float(point[0]) / image.shape[1], 4),
-                 round(float(point[1]) / image.shape[0], 4)]
-                for point in quad
-            ]
+            if blue_minus_red < 45:
+                raise RuntimeError("aqotec_display_not_visible")
+            screen_mode, screen_conf = "fixed", 1.0
 
             live_values = {
-                "energy": fetch_float_state("input_number.aqotec_energie"),
-                "vorlauf": fetch_float_state("input_number.aqotec_vorlauf"),
-                "ruecklauf": fetch_float_state("input_number.aqotec_ruecklauf"),
-                "spread": fetch_float_state("input_number.aqotec_spreizung"),
                 "power": fetch_float_state("input_number.aqotec_leistung"),
                 "flow": fetch_float_state("input_number.aqotec_durchfluss"),
             }
-            # Old RapidOCR helper values may be stale, especially after moving
-            # the camera. Do not teach permanent font templates from them.
-            learned, calibration_diag = [], {"status": "paused_until_verified"}
-
             results = {}
             for field in ("power", "flow"):
                 crop = crop_rect(screen, options[field + "_rect_values"])
@@ -1130,6 +678,19 @@ def main():
                 value, confidence, per_digit_conf, binary, diagnostics, norms = recognize_integer(
                     model, templates, crop, max_digits
                 )
+                # Verify the obvious on-screen zero before trusting generic ONNX.
+                boxes = digit_boxes(binary, max_digits)
+                is_zero, zero_score = recognize_zero(binary, boxes, field)
+                if is_zero:
+                    value, confidence = 0, max(0.90, zero_score)
+                    per_digit_conf = [confidence]
+                    diagnostics = [{
+                        "box": [int(z) for z in boxes[0][:4]],
+                        "digit": 0,
+                        "source": "fixed_zero_reference",
+                        "confidence": round(confidence * 100.0, 1),
+                    }]
+
                 # Require the last glyph to end at the Aqotec numeric
                 # right-alignment column, not at a cropped label/unit.
                 right_edges = [
@@ -1137,35 +698,22 @@ def main():
                     for d in diagnostics
                 ]
                 right_edge = max(right_edges) if right_edges else None
-                # In the live rectified LCD image, the number columns end
-                # around x=0.825. The neighboring units begin near 0.86.
-                # v0.1.11 checked 0.895..0.96 and rejected correct zeros.
+                # Digits end around x=0.925 in the fixed screen image.
                 valid_alignment = (
                     right_edge is not None
-                    and 0.775 * WARP_W <= right_edge <= 0.865 * WARP_W
+                    and 0.88 * WARP_W <= right_edge <= 0.955 * WARP_W
                 )
                 if not valid_alignment:
                     value, confidence = None, 0.0
-                # Expose only bounded geometry diagnostics, no debug images.
-                cc, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-                raw_components = [
-                    [int(x), int(y), int(w), int(h), int(area)]
-                    for x, y, w, h, area in stats[1:]
-                    if area >= 20
-                ][:10]
                 results[field] = {
                     "value": value,
                     "confidence": confidence,
-                    "raw_components": raw_components,
-                    "foreground_fraction": round(float(np.count_nonzero(binary)) / max(1, binary.size), 3),
                     "alignment_valid": valid_alignment,
                     "right_edge": round(right_edge, 1) if right_edge is not None else None,
                     "digit_confidences": per_digit_conf,
                     "diagnostics": diagnostics,
                     "norms": norms,
                 }
-                if options["save_debug_crops"]:
-                    save_debug(field, crop, binary)
 
             rapid_power = live_values.get("power")
             rapid_flow = live_values.get("flow")
@@ -1218,20 +766,8 @@ def main():
                     "flow": accepted_flow,
                     "raw_power": power,
                     "raw_flow": flow,
-                    "power_alignment_valid": results["power"]["alignment_valid"],
-                    "flow_alignment_valid": results["flow"]["alignment_valid"],
-                    "power_right_edge": results["power"]["right_edge"],
-                    "flow_right_edge": results["flow"]["right_edge"],
-                    "power_raw_components": results["power"]["raw_components"],
-                    "flow_raw_components": results["flow"]["raw_components"],
-                    "power_foreground_fraction": results["power"]["foreground_fraction"],
-                    "flow_foreground_fraction": results["flow"]["foreground_fraction"],
                     "power_confidence": round(power_conf * 100.0, 1),
                     "flow_confidence": round(flow_conf * 100.0, 1),
-                    "power_digit_confidences": [round(x * 100.0, 1) for x in results["power"]["digit_confidences"]],
-                    "flow_digit_confidences": [round(x * 100.0, 1) for x in results["flow"]["digit_confidences"]],
-                    "power_diagnostics": results["power"]["diagnostics"],
-                    "flow_diagnostics": results["flow"]["diagnostics"],
                     "power_stable": power_stable,
                     "flow_stable": flow_stable,
                     "power_changed": power_changed,
@@ -1242,16 +778,8 @@ def main():
                     "flow_delta": None if accepted_flow is None or rapid_flow is None else round(accepted_flow - rapid_flow, 1),
                     "power_agrees": None if accepted_power is None or rapid_power is None else int(accepted_power) == int(round(rapid_power)),
                     "flow_agrees": None if accepted_flow is None or rapid_flow is None else int(accepted_flow) == int(round(rapid_flow)),
-                    "screen_mode": screen_mode,
-                    "screen_confidence": screen_conf,
+                    "screen_mode": "fixed",
                     "physical_plausibility_pass": not physically_impossible,
-                    "geometry_mode": "dynamic_quad",
-                    "field_windows": {k: list(options[k + "_rect_values"]) for k in ("power", "flow")},
-                    "required_stable_samples": safe_samples,
-                    "model": "mnist-12.onnx + learned Aqotec font templates",
-                    "template_counts": templates.counts(),
-                    "templates_learned_this_scan": learned,
-                    "calibration": calibration_diag,
                     "shadow_only": True,
                 }
             )
@@ -1267,29 +795,12 @@ def main():
         elapsed = time.monotonic() - started
         log(
             "scan",
-            geometry=payload.get("geometry_mode"),
-            geometry_confidence=payload.get("screen_confidence"),
-            physical_plausibility_pass=payload.get("physical_plausibility_pass"),
             status=payload.get("status"),
-            power_raw_components=payload.get("power_raw_components"),
-            flow_raw_components=payload.get("flow_raw_components"),
-            power_foreground_fraction=payload.get("power_foreground_fraction"),
-            flow_foreground_fraction=payload.get("flow_foreground_fraction"),
-            quad_norm=quad_norm if "quad_norm" in locals() else None,
-            probe_boxes=probe_boxes if "probe_boxes" in locals() else None,
             power=payload.get("power"),
             flow=payload.get("flow"),
             raw_power=payload.get("raw_power"),
             raw_flow=payload.get("raw_flow"),
-            power_confidence=payload.get("power_confidence"),
-            flow_confidence=payload.get("flow_confidence"),
-            power_diag=payload.get("power_diagnostics"),
-            flow_diag=payload.get("flow_diagnostics"),
-            template_counts=payload.get("template_counts"),
-            learned=payload.get("templates_learned_this_scan"),
-            calibration=payload.get("calibration"),
-            screen_mode=payload.get("screen_mode"),
-            elapsed_s=round(elapsed, 3),
+            elapsed_s=round(elapsed, 2),
         )
         time.sleep(max(1.0, options["scan_interval"] - elapsed))
 

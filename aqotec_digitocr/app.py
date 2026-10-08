@@ -33,7 +33,7 @@ FIELD_WINDOWS = {
     # Exclude the kW/lph units further right. Tight vertical bands
     # prevent mixing adjacent LCD rows.
     # Right-aligned numerals on the rectified screen. The digit ends
-    # around x=0.93; v0.1.9 stopped at x=0.85 (before the numeral).
+    # around x=0.93; v0.1.10 stopped at x=0.85 (before the numeral).
     "power": (0.78, 0.404, 0.943, 0.491),
     "flow": (0.78, 0.504, 0.943, 0.586),
 }
@@ -128,7 +128,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.9",
+        "sw_version": "0.1.10",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -1058,14 +1058,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.9",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.10",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.9",
+            "source": "aqotec-digitocr-shadow-v1.10",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -1076,6 +1076,27 @@ def main():
             if quad is None or screen_mode != "auto" or screen_conf < 0.30:
                 raise RuntimeError("aqotec_screen_geometry_unreliable")
             screen = warp_screen(image, quad)
+            # Lightweight geometry-only diagnostics (no stored screenshots).
+            # Used to locate the LCD numbers in the *actual* camera warp.
+            probe_rect = (0.65, 0.27, 0.97, 0.66)
+            probe = crop_rect(screen, probe_rect)
+            probe_mask = make_binary(probe)
+            pn, _, pstats, _ = cv2.connectedComponentsWithStats(probe_mask, 8)
+            probe_boxes = []
+            for x0, y0, bw, bh, area in pstats[1:]:
+                if area >= 45 and bh >= 15:
+                    probe_boxes.append([
+                        round(float(0.65 * WARP_W + x0)),
+                        round(float(0.27 * WARP_H + y0)),
+                        int(bw), int(bh), int(area)
+                    ])
+            probe_boxes.sort(key=lambda b: (b[1], b[0]))
+            probe_boxes = probe_boxes[:28]
+            quad_norm = [
+                [round(float(point[0]) / image.shape[1], 4),
+                 round(float(point[1]) / image.shape[0], 4)]
+                for point in quad
+            ]
 
             live_values = {
                 "energy": fetch_float_state("input_number.aqotec_energie"),
@@ -1221,6 +1242,8 @@ def main():
             geometry_confidence=payload.get("screen_confidence"),
             physical_plausibility_pass=payload.get("physical_plausibility_pass"),
             status=payload.get("status"),
+            quad_norm=quad_norm if "quad_norm" in locals() else None,
+            probe_boxes=probe_boxes if "probe_boxes" in locals() else None,
             power=payload.get("power"),
             flow=payload.get("flow"),
             raw_power=payload.get("raw_power"),

@@ -1,5 +1,5 @@
 name: "Aqotec DigitOCR Shadow"
-version: "0.1.10"
+version: "0.1.11"
 slug: "aqotec_digitocr_shadow"
 description: "Parallel digit-only ONNX OCR for Aqotec power and flow; never writes to the existing Aqotec values."
 url: "https://github.com/BerndDummy/homeassistant_blauberg_s21"
@@ -18,8 +18,8 @@ options:
   min_digit_confidence: 0.40
   stable_samples: 2
   save_debug_crops: false
-  power_rect: "0.665,0.395,0.850,0.500"
-  flow_rect: "0.585,0.505,0.850,0.608"
+  power_rect: "0.780,0.377,0.935,0.498"
+  flow_rect: "0.780,0.502,0.935,0.603"
 schema:
   camera_entity: str
   scan_interval: int(20,600)

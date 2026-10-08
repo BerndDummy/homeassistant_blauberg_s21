@@ -27,6 +27,15 @@ FIELD_WINDOWS = {
     "flow": (0.69, 0.505, 0.845, 0.615),
 }
 
+CALIBRATION_WINDOWS = {
+    "energy": (0.54, 0.285, 0.845, 0.395),
+    "vorlauf": (0.66, 0.625, 0.845, 0.725),
+    "ruecklauf": (0.66, 0.725, 0.845, 0.825),
+    "spread": (0.70, 0.825, 0.845, 0.925),
+}
+
+TEMPLATE_ROOT = Path("/data/font_templates")
+
 SESSION = requests.Session()
 SESSION.headers.update({"Authorization": f"Bearer {TOKEN}"})
 
@@ -88,7 +97,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.2",
+        "sw_version": "0.1.3",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -297,13 +306,17 @@ def warp_screen(image, quad):
     return cv2.warpPerspective(image, matrix, (WARP_W, WARP_H))
 
 
-def field_crop(screen, name):
-    x1, y1, x2, y2 = FIELD_WINDOWS[name]
+def crop_rect(screen, rect):
+    x1, y1, x2, y2 = rect
     h, w = screen.shape[:2]
     return screen[
         int(y1 * h) : int(y2 * h),
         int(x1 * w) : int(x2 * w),
     ].copy()
+
+
+def field_crop(screen, name):
+    return crop_rect(screen, FIELD_WINDOWS[name])
 
 
 def make_binary(crop):
@@ -435,6 +448,81 @@ def hole_features(glyph):
     return len(holes), [round(cy, 3) for _, cy in holes]
 
 
+class FontTemplates:
+    def __init__(self):
+        self.bank = {d: [] for d in range(10)}
+        TEMPLATE_ROOT.mkdir(parents=True, exist_ok=True)
+        for digit in range(10):
+            folder = TEMPLATE_ROOT / str(digit)
+            if not folder.exists():
+                continue
+            for path in sorted(folder.glob("*.png"))[:12]:
+                img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                if img is not None and img.shape == (28, 28):
+                    self.bank[digit].append(img)
+
+    @staticmethod
+    def _score(a, b):
+        aa = cv2.GaussianBlur(a, (3, 3), 0).astype(np.float32) / 255.0
+        bb = cv2.GaussianBlur(b, (3, 3), 0).astype(np.float32) / 255.0
+        best = 0.0
+        for dy in (-2, -1, 0, 1, 2):
+            for dx in (-2, -1, 0, 1, 2):
+                shifted = np.zeros_like(aa)
+                ys = max(0, dy)
+                ye = min(28, 28 + dy)
+                xs = max(0, dx)
+                xe = min(28, 28 + dx)
+                src_ys = max(0, -dy)
+                src_ye = src_ys + (ye - ys)
+                src_xs = max(0, -dx)
+                src_xe = src_xs + (xe - xs)
+                shifted[ys:ye, xs:xe] = aa[src_ys:src_ye, src_xs:src_xe]
+                denom = float(np.linalg.norm(shifted) * np.linalg.norm(bb))
+                if denom > 1e-6:
+                    best = max(best, float(np.sum(shifted * bb) / denom))
+        return best
+
+    def classify(self, norm):
+        best_digit = None
+        best_score = 0.0
+        second_score = 0.0
+        for digit, templates in self.bank.items():
+            digit_best = 0.0
+            for templ in templates:
+                digit_best = max(digit_best, self._score(norm, templ))
+            if digit_best > best_score:
+                second_score = best_score
+                best_score = digit_best
+                best_digit = digit
+            elif digit_best > second_score:
+                second_score = digit_best
+        margin = best_score - second_score
+        return best_digit, best_score, margin
+
+    def learn(self, digit, norm):
+        digit = int(digit)
+        if digit < 0 or digit > 9:
+            return False
+        existing = self.bank[digit]
+        if existing:
+            same = max(self._score(norm, x) for x in existing)
+            if same >= 0.985:
+                return False
+        if len(existing) >= 12:
+            return False
+        folder = TEMPLATE_ROOT / str(digit)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{int(time.time() * 1000)}.png"
+        if not cv2.imwrite(str(path), norm):
+            return False
+        existing.append(norm.copy())
+        return True
+
+    def counts(self):
+        return {str(d): len(v) for d, v in self.bank.items() if v}
+
+
 def softmax(values):
     values = np.asarray(values, dtype=np.float64)
     values -= np.max(values)
@@ -493,23 +581,46 @@ class DigitModel:
         return digit_value, confidence, top3
 
 
-def recognize_integer(model, crop, max_digits=3):
+def extract_glyphs(crop, max_digits=3):
     binary = make_binary(crop)
     boxes = digit_boxes(binary, max_digits)
-    if not boxes:
-        return None, 0.0, [], binary, []
+    items = []
+    for box in boxes:
+        norm, glyph = normalize_digit(binary, box)
+        if norm is not None and glyph is not None:
+            items.append((norm, glyph, box))
+    return binary, items
+
+
+def recognize_integer(model, templates, crop, max_digits=3):
+    binary, items = extract_glyphs(crop, max_digits)
+    if not items:
+        return None, 0.0, [], binary, [], []
 
     digits = []
     confidences = []
     diagnostics = []
-    for box in boxes:
-        norm, glyph = normalize_digit(binary, box)
-        if norm is None or glyph is None:
-            continue
+    norms = []
+    for norm, glyph, box in items:
+        norms.append(norm)
+        template_digit, template_score, template_margin = templates.classify(norm)
         holes, hole_centers = hole_features(glyph)
-        value, confidence, top3 = model.classify(
-            norm, holes=holes, hole_centers=hole_centers
-        )
+
+        if (
+            template_digit is not None
+            and template_score >= 0.88
+            and template_margin >= 0.035
+        ):
+            value = int(template_digit)
+            confidence = min(0.99, max(0.88, template_score))
+            top3 = []
+            source = "aqotec_template"
+        else:
+            value, confidence, top3 = model.classify(
+                norm, holes=holes, hole_centers=hole_centers
+            )
+            source = "onnx"
+
         digits.append(str(value))
         confidences.append(confidence)
         diagnostics.append(
@@ -519,16 +630,65 @@ def recognize_integer(model, crop, max_digits=3):
                 "hole_centers": hole_centers,
                 "digit": value,
                 "confidence": round(confidence * 100.0, 1),
+                "source": source,
+                "template_digit": template_digit,
+                "template_score": round(template_score * 100.0, 1),
+                "template_margin": round(template_margin * 100.0, 1),
                 "top3": top3,
             }
         )
 
     if not digits:
-        return None, 0.0, [], binary, diagnostics
+        return None, 0.0, [], binary, diagnostics, norms
 
     value = int("".join(digits))
     confidence = float(min(confidences))
-    return value, confidence, confidences, binary, diagnostics
+    return value, confidence, confidences, binary, diagnostics, norms
+
+
+def expected_digits(value, decimals=0):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if decimals == 0:
+        return str(int(round(abs(value))))
+    scaled = int(round(abs(value) * (10 ** decimals)))
+    return str(scaled)
+
+
+def calibrate_templates(screen, templates, values):
+    specs = [
+        ("energy", values.get("energy"), 0, 6),
+        ("vorlauf", values.get("vorlauf"), 1, 4),
+        ("ruecklauf", values.get("ruecklauf"), 1, 4),
+        ("spread", values.get("spread"), 1, 3),
+    ]
+    learned = []
+    for name, raw_value, decimals, max_digits in specs:
+        label = expected_digits(raw_value, decimals)
+        if not label:
+            continue
+        crop = crop_rect(screen, CALIBRATION_WINDOWS[name])
+        _, items = extract_glyphs(crop, max_digits)
+        if len(items) != len(label):
+            continue
+        for char, (norm, _, _) in zip(label, items):
+            if templates.learn(int(char), norm):
+                learned.append(int(char))
+
+    # Strong zero bootstrap: when the existing independent path says both
+    # power and flow are zero, the same live LCD provides two zero examples.
+    if values.get("power") == 0.0 and values.get("flow") == 0.0:
+        for name in ("power", "flow"):
+            crop = field_crop(screen, name)
+            _, items = extract_glyphs(crop, 2)
+            if len(items) == 1:
+                if templates.learn(0, items[0][0]):
+                    learned.append(0)
+    return learned
 
 
 class Stability:
@@ -568,6 +728,7 @@ def main():
         raise RuntimeError("SUPERVISOR_TOKEN_missing")
 
     options = read_options()
+    templates = FontTemplates()
     model = DigitModel()
     stability = {"power": Stability(), "flow": Stability()}
     publish_discovery()
@@ -576,41 +737,54 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + Aqotec topology v0.1.2",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.3",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.2",
+            "source": "aqotec-digitocr-shadow-v1.3",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
         try:
             image = fetch_camera(options["camera_entity"])
-            quad, screen_mode, screen_conf = detect_screen_quad(image)
+            quad = fixed_screen_quad(image)
+            screen_mode = "fixed_calibrated"
+            screen_conf = 1.0
             screen = warp_screen(image, quad)
+
+            live_values = {
+                "energy": fetch_float_state("input_number.aqotec_energie"),
+                "vorlauf": fetch_float_state("input_number.aqotec_vorlauf"),
+                "ruecklauf": fetch_float_state("input_number.aqotec_ruecklauf"),
+                "spread": fetch_float_state("input_number.aqotec_spreizung"),
+                "power": fetch_float_state("input_number.aqotec_leistung"),
+                "flow": fetch_float_state("input_number.aqotec_durchfluss"),
+            }
+            learned = calibrate_templates(screen, templates, live_values)
 
             results = {}
             for field in ("power", "flow"):
                 crop = field_crop(screen, field)
                 max_digits = 2 if field == "power" else 4
-                value, confidence, per_digit_conf, binary, diagnostics = recognize_integer(
-                    model, crop, max_digits
+                value, confidence, per_digit_conf, binary, diagnostics, norms = recognize_integer(
+                    model, templates, crop, max_digits
                 )
                 results[field] = {
                     "value": value,
                     "confidence": confidence,
                     "digit_confidences": per_digit_conf,
                     "diagnostics": diagnostics,
+                    "norms": norms,
                 }
                 if options["save_debug_crops"]:
                     save_debug(field, crop, binary)
 
-            rapid_power = fetch_float_state("input_number.aqotec_leistung")
-            rapid_flow = fetch_float_state("input_number.aqotec_durchfluss")
+            rapid_power = live_values.get("power")
+            rapid_flow = live_values.get("flow")
 
             power = results["power"]["value"]
             flow = results["flow"]["value"]
@@ -653,7 +827,9 @@ def main():
                     "flow_agrees": None if flow is None or rapid_flow is None else int(flow) == int(round(rapid_flow)),
                     "screen_mode": screen_mode,
                     "screen_confidence": screen_conf,
-                    "model": "mnist-12.onnx",
+                    "model": "mnist-12.onnx + learned Aqotec font templates",
+                    "template_counts": templates.counts(),
+                    "templates_learned_this_scan": learned,
                     "shadow_only": True,
                 }
             )
@@ -676,6 +852,8 @@ def main():
             flow_confidence=payload.get("flow_confidence"),
             power_diag=payload.get("power_diagnostics"),
             flow_diag=payload.get("flow_diagnostics"),
+            template_counts=payload.get("template_counts"),
+            learned=payload.get("templates_learned_this_scan"),
             screen_mode=payload.get("screen_mode"),
             elapsed_s=round(elapsed, 3),
         )

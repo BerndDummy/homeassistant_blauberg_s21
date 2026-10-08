@@ -97,7 +97,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.4",
+        "sw_version": "0.1.5",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -756,20 +756,30 @@ def calibrate_templates(screen, templates, values):
 
 class Stability:
     def __init__(self):
-        self.last = None
+        self.candidate = None
         self.count = 0
+        self.accepted = None
+        self.accepted_confidence = 0.0
 
     def update(self, value, confidence, threshold, required):
         if value is None or confidence < threshold:
             self.count = 0
-            self.last = None
-            return False
-        if value == self.last:
+            self.candidate = None
+            return self.accepted, False
+
+        if value == self.candidate:
             self.count += 1
         else:
-            self.last = value
+            self.candidate = value
             self.count = 1
-        return self.count >= required
+
+        newly_accepted = False
+        if self.count >= required:
+            if self.accepted != value:
+                newly_accepted = True
+            self.accepted = value
+            self.accepted_confidence = confidence
+        return self.accepted, newly_accepted
 
 
 def save_debug(name, crop, binary):
@@ -800,14 +810,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.4",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.5",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.4",
+            "source": "aqotec-digitocr-shadow-v1.5",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -854,26 +864,32 @@ def main():
             power_conf = results["power"]["confidence"]
             flow_conf = results["flow"]["confidence"]
 
-            power_stable = stability["power"].update(
+            accepted_power, power_changed = stability["power"].update(
                 power, power_conf, options["min_digit_confidence"], options["stable_samples"]
             )
-            flow_stable = stability["flow"].update(
+            accepted_flow, flow_changed = stability["flow"].update(
                 flow, flow_conf, options["min_digit_confidence"], options["stable_samples"]
             )
+            power_stable = accepted_power is not None and power == accepted_power
+            flow_stable = accepted_flow is not None and flow == accepted_flow
 
             status = "ok"
-            if power is None or flow is None:
-                status = "segmentation_error"
+            if accepted_power is None or accepted_flow is None:
+                status = "warming_up"
+            elif power is None or flow is None:
+                status = "held_segmentation_error"
             elif power_conf < options["min_digit_confidence"] or flow_conf < options["min_digit_confidence"]:
-                status = "low_confidence"
-            elif screen_mode == "fixed_fallback":
-                status = "ok_fixed_geometry"
+                status = "held_low_confidence"
+            elif not power_stable or not flow_stable:
+                status = "held_unstable"
 
             payload.update(
                 {
                     "status": status,
-                    "power": power,
-                    "flow": flow,
+                    "power": accepted_power,
+                    "flow": accepted_flow,
+                    "raw_power": power,
+                    "raw_flow": flow,
                     "power_confidence": round(power_conf * 100.0, 1),
                     "flow_confidence": round(flow_conf * 100.0, 1),
                     "power_digit_confidences": [round(x * 100.0, 1) for x in results["power"]["digit_confidences"]],
@@ -882,12 +898,14 @@ def main():
                     "flow_diagnostics": results["flow"]["diagnostics"],
                     "power_stable": power_stable,
                     "flow_stable": flow_stable,
+                    "power_changed": power_changed,
+                    "flow_changed": flow_changed,
                     "rapidocr_power": rapid_power,
                     "rapidocr_flow": rapid_flow,
-                    "power_delta": None if power is None or rapid_power is None else round(power - rapid_power, 1),
-                    "flow_delta": None if flow is None or rapid_flow is None else round(flow - rapid_flow, 1),
-                    "power_agrees": None if power is None or rapid_power is None else int(power) == int(round(rapid_power)),
-                    "flow_agrees": None if flow is None or rapid_flow is None else int(flow) == int(round(rapid_flow)),
+                    "power_delta": None if accepted_power is None or rapid_power is None else round(accepted_power - rapid_power, 1),
+                    "flow_delta": None if accepted_flow is None or rapid_flow is None else round(accepted_flow - rapid_flow, 1),
+                    "power_agrees": None if accepted_power is None or rapid_power is None else int(accepted_power) == int(round(rapid_power)),
+                    "flow_agrees": None if accepted_flow is None or rapid_flow is None else int(accepted_flow) == int(round(rapid_flow)),
                     "screen_mode": screen_mode,
                     "screen_confidence": screen_conf,
                     "model": "mnist-12.onnx + learned Aqotec font templates",
@@ -912,6 +930,8 @@ def main():
             status=payload.get("status"),
             power=payload.get("power"),
             flow=payload.get("flow"),
+            raw_power=payload.get("raw_power"),
+            raw_flow=payload.get("raw_flow"),
             power_confidence=payload.get("power_confidence"),
             flow_confidence=payload.get("flow_confidence"),
             power_diag=payload.get("power_diagnostics"),

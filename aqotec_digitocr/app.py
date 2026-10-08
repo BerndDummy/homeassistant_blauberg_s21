@@ -86,7 +86,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.0",
+        "sw_version": "0.1.1",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -305,67 +305,89 @@ def field_crop(screen, name):
 
 
 def make_binary(crop):
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # The Aqotec screen has a bright blue/cyan background and almost white
+    # characters. The red channel gives substantially more digit/background
+    # separation than grayscale, which overweights the bright blue background.
+    red = crop[:, :, 2]
+    red = cv2.GaussianBlur(red, (3, 3), 0)
+    red = cv2.normalize(red, None, 0, 255, cv2.NORM_MINMAX)
+    _, binary = cv2.threshold(red, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     foreground_ratio = float(np.count_nonzero(binary)) / float(binary.size)
-    if foreground_ratio > 0.40:
+    if foreground_ratio > 0.32:
         binary = cv2.bitwise_not(binary)
 
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)
-    )
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_CLOSE, np.ones((3, 2), np.uint8)
-    )
+    # Suppress isolated camera/compression speckles but keep the LCD glyph holes.
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+
+    h, w = binary.shape[:2]
+    binary[: max(1, int(0.04 * h)), :] = 0
+    binary[h - max(1, int(0.04 * h)) :, :] = 0
     return binary
 
 
-def active_runs(binary):
+def digit_boxes(binary, max_digits):
     h, w = binary.shape[:2]
-    counts = np.count_nonzero(binary, axis=0)
-    threshold = max(2, int(0.12 * h))
-    active = counts >= threshold
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    boxes = []
+    for idx in range(1, count):
+        x, y, bw, bh, area = [int(v) for v in stats[idx]]
+        if bh < int(0.34 * h) or bh > int(0.94 * h):
+            continue
+        if bw < max(3, int(0.025 * w)) or bw > int(0.36 * w):
+            continue
+        if area < max(12, int(0.10 * bw * bh)):
+            continue
+        cy = y + bh / 2.0
+        if cy < 0.20 * h or cy > 0.82 * h:
+            continue
+        boxes.append((x, y, bw, bh, area))
 
-    runs = []
-    start = None
-    for idx, on in enumerate(active):
-        if on and start is None:
-            start = idx
-        elif not on and start is not None:
-            runs.append([start, idx - 1])
-            start = None
-    if start is not None:
-        runs.append([start, w - 1])
-
-    # Join tiny gaps caused by dot-matrix / blur artifacts inside one digit.
+    # Merge components that are only tiny horizontal fragments of one glyph.
+    boxes.sort(key=lambda b: b[0])
     merged = []
-    for run in runs:
-        if not merged or run[0] - merged[-1][1] > 4:
-            merged.append(run)
+    for box in boxes:
+        if not merged:
+            merged.append(list(box))
+            continue
+        px, py, pw, ph, pa = merged[-1]
+        x, y, bw, bh, area = box
+        gap = x - (px + pw)
+        overlap = max(0, min(py + ph, y + bh) - max(py, y))
+        if gap <= 2 and overlap >= 0.45 * min(ph, bh):
+            nx = min(px, x)
+            ny = min(py, y)
+            nr = max(px + pw, x + bw)
+            nb = max(py + ph, y + bh)
+            merged[-1] = [nx, ny, nr - nx, nb - ny, pa + area]
         else:
-            merged[-1][1] = run[1]
+            merged.append(list(box))
 
-    filtered = []
-    for x1, x2 in merged:
-        width = x2 - x1 + 1
-        if 4 <= width <= int(0.45 * w):
-            filtered.append((x1, x2))
-    return filtered
+    # Numeric values are right-aligned. If noise survives, the rightmost
+    # digit-like components are the real value.
+    merged = [tuple(b) for b in merged]
+    if len(merged) > max_digits:
+        merged = merged[-max_digits:]
+    return merged
 
 
-def normalize_digit(binary, x1, x2):
-    strip = binary[:, x1 : x2 + 1]
-    ys, xs = np.where(strip > 0)
+def normalize_digit(binary, box):
+    x, y, bw, bh, _ = box
+    pad = 2
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(binary.shape[1], x + bw + pad)
+    y2 = min(binary.shape[0], y + bh + pad)
+    glyph = binary[y1:y2, x1:x2]
+    ys, xs = np.where(glyph > 0)
     if len(xs) == 0:
-        return None
+        return None, None
 
-    glyph = strip[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    glyph = glyph[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
     gh, gw = glyph.shape[:2]
     if gh < 8 or gw < 2:
-        return None
+        return None, None
 
     scale = min(20.0 / max(1, gw), 20.0 / max(1, gh))
     nw = max(1, int(round(gw * scale)))
@@ -376,7 +398,15 @@ def normalize_digit(binary, x1, x2):
     xoff = (28 - nw) // 2
     yoff = (28 - nh) // 2
     canvas[yoff : yoff + nh, xoff : xoff + nw] = resized
-    return canvas
+    return canvas, glyph
+
+
+def count_holes(glyph):
+    contours, hierarchy = cv2.findContours(glyph.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return 0
+    hierarchy = hierarchy[0]
+    return int(sum(1 for item in hierarchy if item[3] >= 0))
 
 
 def softmax(values):
@@ -395,7 +425,7 @@ class DigitModel:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
-    def classify(self, digit):
+    def classify(self, digit, holes=None):
         variants = [
             digit,
             cv2.dilate(digit, np.ones((2, 2), np.uint8), iterations=1),
@@ -407,36 +437,56 @@ class DigitModel:
             logits = self.session.run([self.output_name], {self.input_name: tensor})[0]
             probs.append(softmax(np.asarray(logits).reshape(-1)))
         mean_prob = np.mean(np.stack(probs, axis=0), axis=0)
-        digit_value = int(np.argmax(mean_prob))
-        return digit_value, float(np.max(mean_prob))
+
+        # Hole topology is extremely useful for the Aqotec font. In particular,
+        # it prevents the recurring 0 -> 8 error that the generic MNIST model
+        # makes on this LCD.
+        ranking = list(np.argsort(mean_prob)[::-1])
+        if holes == 1 and ranking[0] == 8:
+            candidates = [0, 9, 6]
+            digit_value = max(candidates, key=lambda d: mean_prob[d])
+        elif holes >= 2 and 8 in ranking[:4]:
+            digit_value = 8
+        else:
+            digit_value = int(ranking[0])
+
+        top3 = [(int(d), round(float(mean_prob[d]) * 100.0, 1)) for d in ranking[:3]]
+        return digit_value, float(mean_prob[digit_value]), top3
 
 
 def recognize_integer(model, crop, max_digits=3):
     binary = make_binary(crop)
-    runs = active_runs(binary)
-
-    # A fixed right-aligned numeric field should contain no more than max_digits.
-    if len(runs) > max_digits:
-        runs = runs[-max_digits:]
-    if not runs:
-        return None, 0.0, [], binary
+    boxes = digit_boxes(binary, max_digits)
+    if not boxes:
+        return None, 0.0, [], binary, []
 
     digits = []
     confidences = []
-    for x1, x2 in runs:
-        norm = normalize_digit(binary, x1, x2)
-        if norm is None:
+    diagnostics = []
+    for box in boxes:
+        norm, glyph = normalize_digit(binary, box)
+        if norm is None or glyph is None:
             continue
-        value, confidence = model.classify(norm)
+        holes = count_holes(glyph)
+        value, confidence, top3 = model.classify(norm, holes=holes)
         digits.append(str(value))
         confidences.append(confidence)
+        diagnostics.append(
+            {
+                "box": [int(v) for v in box[:4]],
+                "holes": holes,
+                "digit": value,
+                "confidence": round(confidence * 100.0, 1),
+                "top3": top3,
+            }
+        )
 
     if not digits:
-        return None, 0.0, [], binary
+        return None, 0.0, [], binary, diagnostics
 
     value = int("".join(digits))
     confidence = float(min(confidences))
-    return value, confidence, confidences, binary
+    return value, confidence, confidences, binary, diagnostics
 
 
 class Stability:
@@ -484,14 +534,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX digit-only baseline",
+        model="MNIST-12 ONNX + Aqotec red-channel segmentation v0.1.1",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1",
+            "source": "aqotec-digitocr-shadow-v1.1",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -504,11 +554,15 @@ def main():
             results = {}
             for field in ("power", "flow"):
                 crop = field_crop(screen, field)
-                value, confidence, per_digit_conf, binary = recognize_integer(model, crop, 3)
+                max_digits = 2 if field == "power" else 4
+                value, confidence, per_digit_conf, binary, diagnostics = recognize_integer(
+                    model, crop, max_digits
+                )
                 results[field] = {
                     "value": value,
                     "confidence": confidence,
                     "digit_confidences": per_digit_conf,
+                    "diagnostics": diagnostics,
                 }
                 if options["save_debug_crops"]:
                     save_debug(field, crop, binary)
@@ -545,6 +599,8 @@ def main():
                     "flow_confidence": round(flow_conf * 100.0, 1),
                     "power_digit_confidences": [round(x * 100.0, 1) for x in results["power"]["digit_confidences"]],
                     "flow_digit_confidences": [round(x * 100.0, 1) for x in results["flow"]["digit_confidences"]],
+                    "power_diagnostics": results["power"]["diagnostics"],
+                    "flow_diagnostics": results["flow"]["diagnostics"],
                     "power_stable": power_stable,
                     "flow_stable": flow_stable,
                     "rapidocr_power": rapid_power,
@@ -576,6 +632,8 @@ def main():
             flow=payload.get("flow"),
             power_confidence=payload.get("power_confidence"),
             flow_confidence=payload.get("flow_confidence"),
+            power_diag=payload.get("power_diagnostics"),
+            flow_diag=payload.get("flow_diagnostics"),
             screen_mode=payload.get("screen_mode"),
             elapsed_s=round(elapsed, 3),
         )

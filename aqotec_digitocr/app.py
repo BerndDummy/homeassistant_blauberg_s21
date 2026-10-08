@@ -26,15 +26,15 @@ WARP_H = 600
 FIELD_WINDOWS = {
     # Calibrated from the fixed Aqotec screen geometry. Earlier windows clipped
     # the lower edge of each LCD digit, which made a real 0 look like 8/1/7.
-    "power": (0.69, 0.405, 0.845, 0.515),
-    "flow": (0.69, 0.505, 0.845, 0.615),
+    "power": (0.73, 0.370, 0.955, 0.495),
+    "flow": (0.73, 0.480, 0.955, 0.605),
 }
 
 CALIBRATION_WINDOWS = {
-    "energy": (0.54, 0.285, 0.845, 0.395),
-    "vorlauf": (0.66, 0.625, 0.845, 0.725),
-    "ruecklauf": (0.66, 0.725, 0.845, 0.825),
-    "spread": (0.70, 0.825, 0.845, 0.925),
+    "energy": (0.64, 0.265, 0.95, 0.385),
+    "vorlauf": (0.75, 0.590, 0.955, 0.710),
+    "ruecklauf": (0.75, 0.690, 0.955, 0.815),
+    "spread": (0.76, 0.805, 0.955, 0.925),
 }
 
 TEMPLATE_ROOT = Path("/data/font_templates")
@@ -249,8 +249,10 @@ def detect_screen_quad(image):
     ).astype(np.uint8) * 255
 
     # Ignore zones where the display cannot be in this fixed camera installation.
-    mask[: int(0.18 * h), :] = 0
-    mask[:, : int(0.20 * w)] = 0
+    # The camera can be tilted/shifted. Keep the top 18% available:
+    # the screen is presently above that line. Ignore only image margins.
+    mask[: int(0.025 * h), :] = 0
+    mask[:, : int(0.12 * w)] = 0
 
     close_k = max(9, int(min(h, w) * 0.025) | 1)
     mask = cv2.morphologyEx(
@@ -279,7 +281,7 @@ def detect_screen_quad(image):
             continue
 
         cx, cy = rect[0]
-        if cx < 0.42 * w or cy < 0.42 * h:
+        if cx < 0.25 * w or cy < 0.20 * h:
             continue
 
         perimeter = cv2.arcLength(contour, True)
@@ -298,10 +300,10 @@ def detect_screen_quad(image):
             best_score = score
             best = quad
 
-    # Conservative threshold: when automatic geometry is doubtful, the fixed,
-    # calibrated camera geometry is safer for a shadow sensor.
+    # Never fall back to obsolete fixed coordinates after camera movement.
+    # An uncertain frame must produce no new shadow measurement.
     if best is None or best_score < 0.055:
-        return fixed_screen_quad(image), "fixed_fallback", 0.0
+        return None, "not_found", 0.0
 
     return order_quad(best), "auto", round(min(1.0, best_score / 0.25), 3)
 
@@ -1012,9 +1014,9 @@ def main():
 
         try:
             image = fetch_camera(options["camera_entity"])
-            quad = fixed_screen_quad(image)
-            screen_mode = "fixed_calibrated"
-            screen_conf = 1.0
+            quad, screen_mode, screen_conf = detect_screen_quad(image)
+            if quad is None or screen_mode != "auto" or screen_conf < 0.30:
+                raise RuntimeError("aqotec_screen_geometry_unreliable")
             screen = warp_screen(image, quad)
 
             live_values = {
@@ -1025,7 +1027,9 @@ def main():
                 "power": fetch_float_state("input_number.aqotec_leistung"),
                 "flow": fetch_float_state("input_number.aqotec_durchfluss"),
             }
-            learned, calibration_diag = calibrate_templates(screen, templates, live_values)
+            # Old RapidOCR helper values may be stale, especially after moving
+            # the camera. Do not teach permanent font templates from them.
+            learned, calibration_diag = [], {"status": "paused_until_verified"}
 
             results = {}
             for field in ("power", "flow"):
@@ -1052,11 +1056,22 @@ def main():
             power_conf = results["power"]["confidence"]
             flow_conf = results["flow"]["confidence"]
 
+            # A hot-water loop cannot deliver kW from an almost zero L/h flow.
+            # 0.10 kW per L/h assumes an intentionally broad, conservative
+            # maximum temperature difference (about 86 K for water).
+            physically_impossible = (
+                power is not None and flow is not None and
+                power > max(0.25, 0.10 * flow)
+            )
+            if physically_impossible:
+                power, flow = None, None
+            safe_confidence = max(0.75, options["min_digit_confidence"])
+            safe_samples = max(3, options["stable_samples"])
             accepted_power, power_changed = stability["power"].update(
-                power, power_conf, options["min_digit_confidence"], options["stable_samples"]
+                power, power_conf, safe_confidence, safe_samples
             )
             accepted_flow, flow_changed = stability["flow"].update(
-                flow, flow_conf, options["min_digit_confidence"], options["stable_samples"]
+                flow, flow_conf, safe_confidence, safe_samples
             )
             power_stable = accepted_power is not None and power == accepted_power
             flow_stable = accepted_flow is not None and flow == accepted_flow
@@ -1064,9 +1079,11 @@ def main():
             status = "ok"
             if accepted_power is None or accepted_flow is None:
                 status = "warming_up"
+            elif physically_impossible:
+                status = "held_physical_inconsistency"
             elif power is None or flow is None:
                 status = "held_segmentation_error"
-            elif power_conf < options["min_digit_confidence"] or flow_conf < options["min_digit_confidence"]:
+            elif power_conf < safe_confidence or flow_conf < safe_confidence:
                 status = "held_low_confidence"
             elif not power_stable or not flow_stable:
                 status = "held_unstable"
@@ -1096,6 +1113,9 @@ def main():
                     "flow_agrees": None if accepted_flow is None or rapid_flow is None else int(accepted_flow) == int(round(rapid_flow)),
                     "screen_mode": screen_mode,
                     "screen_confidence": screen_conf,
+                    "physical_plausibility_pass": not physically_impossible,
+                    "geometry_mode": "dynamic_quad",
+                    "required_stable_samples": safe_samples,
                     "model": "mnist-12.onnx + learned Aqotec font templates",
                     "template_counts": templates.counts(),
                     "templates_learned_this_scan": learned,
@@ -1115,6 +1135,9 @@ def main():
         elapsed = time.monotonic() - started
         log(
             "scan",
+            geometry=payload.get("geometry_mode"),
+            geometry_confidence=payload.get("screen_confidence"),
+            physical_plausibility_pass=payload.get("physical_plausibility_pass"),
             status=payload.get("status"),
             power=payload.get("power"),
             flow=payload.get("flow"),

@@ -97,7 +97,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.3",
+        "sw_version": "0.1.4",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -646,6 +646,59 @@ def recognize_integer(model, templates, crop, max_digits=3):
     return value, confidence, confidences, binary, diagnostics, norms
 
 
+def extract_expected_glyphs(crop, expected_count):
+    binary, items = extract_glyphs(crop, max(1, expected_count + 1))
+    if len(items) == expected_count:
+        return [item[0] for item in items], "components"
+
+    # Calibration fallback for the fixed-width Aqotec bitmap font. Remove
+    # decimal points/speckles, then split the right-aligned numeric run near
+    # equal pitch boundaries. This is only used to LEARN templates from fields
+    # whose value is already known from the existing independent pipeline.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    clean = np.zeros_like(binary)
+    h, w = binary.shape[:2]
+    for idx in range(1, count):
+        x, y, bw, bh, area = [int(v) for v in stats[idx]]
+        if bh >= int(0.32 * h) and area >= 10:
+            clean[labels == idx] = 255
+
+    cols = np.count_nonzero(clean, axis=0)
+    active = np.where(cols >= max(1, int(0.06 * h)))[0]
+    if len(active) < expected_count * 3:
+        return [], "none"
+
+    left, right = int(active.min()), int(active.max())
+    pitch = (right - left + 1) / float(expected_count)
+    boundaries = [left]
+    for i in range(1, expected_count):
+        nominal = left + i * pitch
+        radius = max(2, int(0.28 * pitch))
+        lo = max(boundaries[-1] + 2, int(nominal - radius))
+        hi = min(right - 2, int(nominal + radius))
+        if hi <= lo:
+            return [], "none"
+        split = min(range(lo, hi + 1), key=lambda x: int(cols[x]))
+        boundaries.append(split)
+    boundaries.append(right + 1)
+
+    norms = []
+    for i in range(expected_count):
+        sx1, sx2 = boundaries[i], boundaries[i + 1]
+        if sx2 - sx1 < 3:
+            return [], "none"
+        segment = clean[:, sx1:sx2]
+        ys, xs = np.where(segment > 0)
+        if len(xs) == 0:
+            return [], "none"
+        box = (sx1, int(ys.min()), sx2 - sx1, int(ys.max() - ys.min() + 1), int(len(xs)))
+        norm, glyph = normalize_digit(clean, box)
+        if norm is None or glyph is None:
+            return [], "none"
+        norms.append(norm)
+    return norms, "pitch_split"
+
+
 def expected_digits(value, decimals=0):
     if value is None:
         return None
@@ -661,34 +714,44 @@ def expected_digits(value, decimals=0):
 
 def calibrate_templates(screen, templates, values):
     specs = [
-        ("energy", values.get("energy"), 0, 6),
-        ("vorlauf", values.get("vorlauf"), 1, 4),
-        ("ruecklauf", values.get("ruecklauf"), 1, 4),
-        ("spread", values.get("spread"), 1, 3),
+        ("energy", values.get("energy"), 0),
+        ("vorlauf", values.get("vorlauf"), 1),
+        ("ruecklauf", values.get("ruecklauf"), 1),
+        ("spread", values.get("spread"), 1),
     ]
     learned = []
-    for name, raw_value, decimals, max_digits in specs:
+    diagnostics = {}
+    for name, raw_value, decimals in specs:
         label = expected_digits(raw_value, decimals)
         if not label:
             continue
         crop = crop_rect(screen, CALIBRATION_WINDOWS[name])
-        _, items = extract_glyphs(crop, max_digits)
-        if len(items) != len(label):
+        norms, mode = extract_expected_glyphs(crop, len(label))
+        diagnostics[name] = {
+            "label": label,
+            "glyphs": len(norms),
+            "mode": mode,
+        }
+        if len(norms) != len(label):
             continue
-        for char, (norm, _, _) in zip(label, items):
+        for char, norm in zip(label, norms):
             if templates.learn(int(char), norm):
                 learned.append(int(char))
 
-    # Strong zero bootstrap: when the existing independent path says both
-    # power and flow are zero, the same live LCD provides two zero examples.
-    if values.get("power") == 0.0 and values.get("flow") == 0.0:
+    # Bootstrap zero only until a small stable seed exists. We never keep
+    # teaching "0" forever from a potentially stale helper value.
+    if (
+        len(templates.bank[0]) < 4
+        and values.get("power") == 0.0
+        and values.get("flow") == 0.0
+    ):
         for name in ("power", "flow"):
             crop = field_crop(screen, name)
             _, items = extract_glyphs(crop, 2)
             if len(items) == 1:
                 if templates.learn(0, items[0][0]):
                     learned.append(0)
-    return learned
+    return learned, diagnostics
 
 
 class Stability:
@@ -737,14 +800,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.3",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.4",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.3",
+            "source": "aqotec-digitocr-shadow-v1.4",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -764,7 +827,7 @@ def main():
                 "power": fetch_float_state("input_number.aqotec_leistung"),
                 "flow": fetch_float_state("input_number.aqotec_durchfluss"),
             }
-            learned = calibrate_templates(screen, templates, live_values)
+            learned, calibration_diag = calibrate_templates(screen, templates, live_values)
 
             results = {}
             for field in ("power", "flow"):
@@ -830,6 +893,7 @@ def main():
                     "model": "mnist-12.onnx + learned Aqotec font templates",
                     "template_counts": templates.counts(),
                     "templates_learned_this_scan": learned,
+                    "calibration": calibration_diag,
                     "shadow_only": True,
                 }
             )
@@ -854,6 +918,7 @@ def main():
             flow_diag=payload.get("flow_diagnostics"),
             template_counts=payload.get("template_counts"),
             learned=payload.get("templates_learned_this_scan"),
+            calibration=payload.get("calibration"),
             screen_mode=payload.get("screen_mode"),
             elapsed_s=round(elapsed, 3),
         )

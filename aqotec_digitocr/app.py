@@ -21,8 +21,10 @@ WARP_H = 600
 # Normalized field windows in the rectified Aqotec display.
 # Only the numeric portion is included; units are intentionally excluded.
 FIELD_WINDOWS = {
-    "power": (0.68, 0.37, 0.84, 0.50),
-    "flow": (0.68, 0.47, 0.84, 0.60),
+    # Calibrated from the fixed Aqotec screen geometry. Earlier windows clipped
+    # the lower edge of each LCD digit, which made a real 0 look like 8/1/7.
+    "power": (0.69, 0.405, 0.845, 0.515),
+    "flow": (0.69, 0.505, 0.845, 0.615),
 }
 
 SESSION = requests.Session()
@@ -86,7 +88,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.1",
+        "sw_version": "0.1.2",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -401,12 +403,36 @@ def normalize_digit(binary, box):
     return canvas, glyph
 
 
-def count_holes(glyph):
-    contours, hierarchy = cv2.findContours(glyph.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if hierarchy is None:
-        return 0
-    hierarchy = hierarchy[0]
-    return int(sum(1 for item in hierarchy if item[3] >= 0))
+def hole_features(glyph):
+    # Count only sizeable enclosed regions. JPEG/block noise can create tiny
+    # child contours that previously turned a real LCD 0 into a false 8.
+    def analyse(img):
+        contours, hierarchy = cv2.findContours(img.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            return []
+        hierarchy = hierarchy[0]
+        min_area = max(4.0, 0.018 * float(img.shape[0] * img.shape[1]))
+        holes = []
+        for idx, item in enumerate(hierarchy):
+            if item[3] < 0:
+                continue
+            area = abs(cv2.contourArea(contours[idx]))
+            if area < min_area:
+                continue
+            m = cv2.moments(contours[idx])
+            if m["m00"] == 0:
+                continue
+            cy = float(m["m01"] / m["m00"]) / max(1.0, float(img.shape[0]))
+            holes.append((area, cy))
+        return holes
+
+    original = analyse(glyph)
+    eroded = analyse(cv2.erode(glyph, np.ones((2, 2), np.uint8), iterations=1))
+    # A spurious thin bridge in a blurred 0 disappears after erosion. A real
+    # 8 normally keeps two substantial lobes. Prefer the simpler topology.
+    holes = eroded if 0 < len(eroded) < len(original) else original
+    holes.sort(reverse=True)
+    return len(holes), [round(cy, 3) for _, cy in holes]
 
 
 def softmax(values):
@@ -425,7 +451,7 @@ class DigitModel:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
-    def classify(self, digit, holes=None):
+    def classify(self, digit, holes=None, hole_centers=None):
         variants = [
             digit,
             cv2.dilate(digit, np.ones((2, 2), np.uint8), iterations=1),
@@ -438,20 +464,33 @@ class DigitModel:
             probs.append(softmax(np.asarray(logits).reshape(-1)))
         mean_prob = np.mean(np.stack(probs, axis=0), axis=0)
 
-        # Hole topology is extremely useful for the Aqotec font. In particular,
-        # it prevents the recurring 0 -> 8 error that the generic MNIST model
-        # makes on this LCD.
+        # Aqotec's own LCD topology is a stronger cue than MNIST for looped
+        # digits. This is intentionally font-specific: 0 has one central hole,
+        # 8 has two, 9 one high hole and 6 one low hole.
         ranking = list(np.argsort(mean_prob)[::-1])
-        if holes == 1 and ranking[0] == 8:
-            candidates = [0, 9, 6]
-            digit_value = max(candidates, key=lambda d: mean_prob[d])
-        elif holes >= 2 and 8 in ranking[:4]:
-            digit_value = 8
+        topology_digit = None
+        topology_conf = 0.0
+        centers = hole_centers or []
+        if holes == 2:
+            topology_digit, topology_conf = 8, 0.94
+        elif holes == 1 and centers:
+            cy = centers[0]
+            if 0.38 <= cy <= 0.62:
+                topology_digit, topology_conf = 0, 0.94
+            elif cy < 0.38:
+                topology_digit, topology_conf = 9, 0.88
+            elif cy > 0.62:
+                topology_digit, topology_conf = 6, 0.88
+
+        if topology_digit is not None:
+            digit_value = topology_digit
+            confidence = max(float(mean_prob[digit_value]), topology_conf)
         else:
             digit_value = int(ranking[0])
+            confidence = float(mean_prob[digit_value])
 
         top3 = [(int(d), round(float(mean_prob[d]) * 100.0, 1)) for d in ranking[:3]]
-        return digit_value, float(mean_prob[digit_value]), top3
+        return digit_value, confidence, top3
 
 
 def recognize_integer(model, crop, max_digits=3):
@@ -467,14 +506,17 @@ def recognize_integer(model, crop, max_digits=3):
         norm, glyph = normalize_digit(binary, box)
         if norm is None or glyph is None:
             continue
-        holes = count_holes(glyph)
-        value, confidence, top3 = model.classify(norm, holes=holes)
+        holes, hole_centers = hole_features(glyph)
+        value, confidence, top3 = model.classify(
+            norm, holes=holes, hole_centers=hole_centers
+        )
         digits.append(str(value))
         confidences.append(confidence)
         diagnostics.append(
             {
                 "box": [int(v) for v in box[:4]],
                 "holes": holes,
+                "hole_centers": hole_centers,
                 "digit": value,
                 "confidence": round(confidence * 100.0, 1),
                 "top3": top3,
@@ -534,14 +576,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + Aqotec red-channel segmentation v0.1.1",
+        model="MNIST-12 ONNX + Aqotec topology v0.1.2",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.1",
+            "source": "aqotec-digitocr-shadow-v1.2",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }

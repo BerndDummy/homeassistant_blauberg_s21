@@ -1,9 +1,12 @@
+import base64
 import json
 import math
 import os
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import cv2
 import numpy as np
@@ -35,6 +38,13 @@ CALIBRATION_WINDOWS = {
 }
 
 TEMPLATE_ROOT = Path("/data/font_templates")
+SURVEY_ROOT = Path("/data/survey")
+SURVEY_PORT = 8099
+SURVEY_INTERVAL = 1.2
+SURVEY_MAX_FILES = 80
+survey_active = False
+survey_last_hash = None
+survey_lock = threading.Lock()
 
 SESSION = requests.Session()
 SESSION.headers.update({"Authorization": f"Bearer {TOKEN}"})
@@ -97,7 +107,7 @@ def publish_discovery():
         "name": "Aqotec DigitOCR Shadow",
         "manufacturer": "Local",
         "model": "Digit-only ONNX shadow reader",
-        "sw_version": "0.1.5",
+        "sw_version": "0.1.6",
     }
     common = {
         "state_topic": "aqotec/digitocr/state",
@@ -796,11 +806,189 @@ def save_debug(name, crop, binary):
             pass
 
 
+
+def survey_hash(screen):
+    gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (32, 18), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (3, 3), 0)
+    return (small > np.median(small)).astype(np.uint8).reshape(-1)
+
+
+def hash_distance(a, b):
+    if a is None or b is None:
+        return 999
+    return int(np.count_nonzero(a != b))
+
+
+def survey_capture_loop(camera_entity):
+    global survey_last_hash
+    SURVEY_ROOT.mkdir(parents=True, exist_ok=True)
+    while True:
+        if not survey_active:
+            time.sleep(0.25)
+            continue
+        try:
+            image = fetch_camera(camera_entity)
+            screen = warp_screen(image, fixed_screen_quad(image))
+            hsh = survey_hash(screen)
+            with survey_lock:
+                distance = hash_distance(survey_last_hash, hsh)
+                # A page change alters a large portion of the screen. Ignore tiny
+                # live-value flicker so a 3-second hold does not create duplicates.
+                if survey_last_hash is None or distance >= 26:
+                    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                    ms = int((time.time() % 1) * 1000)
+                    path = SURVEY_ROOT / f"{stamp}_{ms:03d}.jpg"
+                    cv2.imwrite(
+                        str(path),
+                        screen,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 78],
+                    )
+                    survey_last_hash = hsh
+                    files = sorted(
+                        SURVEY_ROOT.glob("*.jpg"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for old in files[SURVEY_MAX_FILES:]:
+                        try:
+                            old.unlink()
+                        except OSError:
+                            pass
+                    log("survey_capture", file=path.name, change_bits=distance)
+        except Exception as exc:
+            log("survey_capture_error", error=str(exc))
+        time.sleep(SURVEY_INTERVAL)
+
+
+def survey_files():
+    SURVEY_ROOT.mkdir(parents=True, exist_ok=True)
+    files = sorted(SURVEY_ROOT.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
+    return [
+        {
+            "name": p.name,
+            "size": p.stat().st_size,
+            "mtime": p.stat().st_mtime,
+        }
+        for p in files
+    ]
+
+
+class SurveyHandler(BaseHTTPRequestHandler):
+    def _json(self, status, payload):
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/health"):
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "survey_active": survey_active,
+                    "interval_s": SURVEY_INTERVAL,
+                    "files": len(survey_files()),
+                },
+            )
+            return
+        if parsed.path == "/survey/list":
+            self._json(
+                200,
+                {
+                    "active": survey_active,
+                    "interval_s": SURVEY_INTERVAL,
+                    "files": survey_files(),
+                },
+            )
+            return
+        if parsed.path == "/survey/image":
+            params = parse_qs(parsed.query)
+            name = (params.get("name") or [""])[0]
+            if not name or Path(name).name != name:
+                self._json(400, {"error": "invalid_name"})
+                return
+            path = SURVEY_ROOT / name
+            if not path.exists():
+                self._json(404, {"error": "not_found"})
+                return
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            self._json(
+                200,
+                {
+                    "name": name,
+                    "mime": "image/jpeg",
+                    "base64": encoded,
+                },
+            )
+            return
+        self._json(404, {"error": "not_found"})
+
+    def do_POST(self):
+        global survey_active, survey_last_hash
+        parsed = urlparse(self.path)
+        if parsed.path == "/survey/start":
+            with survey_lock:
+                survey_last_hash = None
+            survey_active = True
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "active": True,
+                    "interval_s": SURVEY_INTERVAL,
+                    "instruction": "Hold each page for about 3 seconds.",
+                },
+            )
+            return
+        if parsed.path == "/survey/stop":
+            survey_active = False
+            self._json(200, {"ok": True, "active": False, "files": len(survey_files())})
+            return
+        if parsed.path == "/survey/clear":
+            survey_active = False
+            with survey_lock:
+                survey_last_hash = None
+                for path in SURVEY_ROOT.glob("*.jpg"):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+            self._json(200, {"ok": True, "active": False, "files": 0})
+            return
+        self._json(404, {"error": "not_found"})
+
+
+def start_survey_server(camera_entity):
+    SURVEY_ROOT.mkdir(parents=True, exist_ok=True)
+    threading.Thread(
+        target=survey_capture_loop,
+        args=(camera_entity,),
+        daemon=True,
+        name="survey-capture",
+    ).start()
+    server = ThreadingHTTPServer(("0.0.0.0", SURVEY_PORT), SurveyHandler)
+    threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+        name="survey-api",
+    ).start()
+    log("survey_server_started", port=SURVEY_PORT, interval_s=SURVEY_INTERVAL)
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("SUPERVISOR_TOKEN_missing")
 
     options = read_options()
+    start_survey_server(options["camera_entity"])
     templates = FontTemplates()
     model = DigitModel()
     stability = {"power": Stability(), "flow": Stability()}
@@ -810,14 +998,14 @@ def main():
         "started",
         camera=options["camera_entity"],
         scan_interval=options["scan_interval"],
-        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.5",
+        model="MNIST-12 ONNX + learned Aqotec font templates v0.1.6",
         mode="shadow_only",
     )
 
     while True:
         started = time.monotonic()
         payload = {
-            "source": "aqotec-digitocr-shadow-v1.5",
+            "source": "aqotec-digitocr-shadow-v1.6",
             "status": "starting",
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
